@@ -61,6 +61,19 @@ class BaseTestBigQueryAdapter(unittest.TestCase):
                     "keyfile": "/tmp/dummy-service-account.json",
                     "threads": 1,
                 },
+                "external_oauth_wif": {
+                    "type": "bigquery",
+                    "method": "external-oauth-wif",
+                    "project": "dbt-unit-000000",
+                    "schema": "dummy_schema",
+                    "threads": 1,
+                    "token_endpoint": {
+                        "type": "entra",
+                        "request_url": "https://example.com/token",
+                        "request_data": "mydata",
+                    },
+                    "audience": "https://example.com/audience",
+                },
                 "loc": {
                     "type": "bigquery",
                     "method": "oauth",
@@ -70,6 +83,14 @@ class BaseTestBigQueryAdapter(unittest.TestCase):
                     "location": "Luna Station",
                     "priority": "batch",
                     "maximum_bytes_billed": 0,
+                },
+                "api_endpoint": {
+                    "type": "bigquery",
+                    "method": "oauth",
+                    "project": "dbt-unit-000000",
+                    "schema": "dummy_schema",
+                    "threads": 1,
+                    "api_endpoint": "https://localhost:3001",
                 },
                 "impersonate": {
                     "type": "bigquery",
@@ -117,7 +138,7 @@ class BaseTestBigQueryAdapter(unittest.TestCase):
                     "schema": "dummy_schema",
                     "threads": 1,
                     "gcs_bucket": "dummy-bucket",
-                    "dataproc_region": "europe-west1",
+                    "compute_region": "europe-west1",
                     "submission_method": "serverless",
                     "dataproc_batch": {
                         "environment_config": {
@@ -142,7 +163,7 @@ class BaseTestBigQueryAdapter(unittest.TestCase):
                     "schema": "dummy_schema",
                     "threads": 1,
                     "gcs_bucket": "dummy-bucket",
-                    "dataproc_region": "europe-west1",
+                    "compute_region": "europe-west1",
                     "submission_method": "serverless",
                 },
             },
@@ -340,6 +361,23 @@ class TestBigQueryAdapterAcquire(BaseTestBigQueryAdapter):
         mock_open_connection.assert_called_once()
 
     @patch("dbt.adapters.bigquery.BigQueryConnectionManager.open", return_value=_bq_conn())
+    def test_acquire_connection_external_oauth_wif_validations(self, mock_open_connection):
+        adapter = self.get_adapter("external_oauth_wif")
+        try:
+            connection = adapter.acquire_connection("dummy")
+            self.assertEqual(connection.type, "bigquery")
+
+        except dbt_common.exceptions.base.DbtValidationError as e:
+            self.fail("got DbtValidationError: {}".format(str(e)))
+
+        except BaseException:
+            raise
+
+        mock_open_connection.assert_not_called()
+        connection.handle
+        mock_open_connection.assert_called_once()
+
+    @patch("dbt.adapters.bigquery.BigQueryConnectionManager.open", return_value=_bq_conn())
     def test_acquire_connection_priority(self, mock_open_connection):
         adapter = self.get_adapter("loc")
         try:
@@ -389,7 +427,7 @@ class TestBigQueryAdapterAcquire(BaseTestBigQueryAdapter):
         self.assertEqual(len(list(adapter.cancel_open_connections())), 1)
 
     @patch("dbt.adapters.bigquery.clients.ClientOptions")
-    @patch("dbt.adapters.bigquery.credentials.default")
+    @patch("dbt.adapters.bigquery.credentials._create_bigquery_defaults")
     @patch("dbt.adapters.bigquery.clients.BigQueryClient")
     def test_location_user_agent(self, MockClient, mock_auth_default, MockClientOptions):
         creds = MagicMock()
@@ -408,6 +446,28 @@ class TestBigQueryAdapterAcquire(BaseTestBigQueryAdapter):
             client_info=HasUserAgent(),
             client_options=mock_client_options,
         )
+
+    @patch("dbt.adapters.bigquery.clients.ClientOptions")
+    @patch("dbt.adapters.bigquery.credentials._create_bigquery_defaults")
+    @patch("dbt.adapters.bigquery.clients.BigQueryClient")
+    def test_api_endpoint_settable(self, MockClient, mock_auth_default, MockClientOptions):
+        """Ensure api_endpoint is set on ClientOptions and passed to BigQueryClient."""
+
+        creds = MagicMock()
+        mock_auth_default.return_value = (creds, MagicMock())
+        mock_client_options = MockClientOptions.return_value
+
+        adapter = self.get_adapter("api_endpoint")
+        connection = adapter.acquire_connection("dummy")
+        MockClient.assert_not_called()
+        connection.handle
+
+        MockClientOptions.assert_called_once()
+        kwargs = MockClientOptions.call_args.kwargs
+        assert kwargs.get("api_endpoint") == "https://localhost:3001"
+
+        MockClient.assert_called_once()
+        assert MockClient.call_args.kwargs["client_options"] is mock_client_options
 
 
 class HasUserAgent:
@@ -807,6 +867,124 @@ class TestBigQueryAdapter(BaseTestBigQueryAdapter):
         actual = adapter.get_view_options(mock_config, node={})
         self.assertEqual(expected, actual)
 
+    def test_get_common_options_labels_merge(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "labels": {"existing_label": "value1"},
+            "labels_from_meta": True,
+            "meta": {"meta_label": "value2"},
+        }
+        mock_config.get.side_effect = lambda name: config.get(name)
+
+        expected = {"labels": [("meta_label", "value2"), ("existing_label", "value1")]}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        self.assertEqual(expected, actual)
+
+    def test_get_common_options_labels_no_meta(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "labels": {"existing_label": "value1"},
+            "labels_from_meta": True,
+            "meta": {},
+        }
+        mock_config.get.side_effect = lambda name: config.get(name)
+
+        expected = {"labels": [("existing_label", "value1")]}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        self.assertEqual(expected, actual)
+
+    def test_get_common_options_labels_no_labels_from_meta(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "labels": {"existing_label": "value1"},
+            "labels_from_meta": False,
+            "meta": {"meta_label": "value2"},
+        }
+        mock_config.get.side_effect = lambda name: config.get(name)
+
+        expected = {"labels": [("existing_label", "value1")]}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        self.assertEqual(expected, actual)
+
+    def test_get_common_options_no_labels(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "labels_from_meta": True,
+            "meta": {"meta_label": "value2"},
+        }
+        mock_config.get.side_effect = lambda name: config.get(name)
+
+        expected = {"labels": [("meta_label", "value2")]}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        self.assertEqual(expected, actual)
+
+    def test_get_common_options_empty(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {}
+        mock_config.get.side_effect = lambda name: config.get(name)
+
+        expected = {}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        self.assertEqual(expected, actual)
+
+    def test_get_common_options_resource_tags(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "resource_tags": {"test-project/env": "dev", "test-project/team": "data"},
+        }
+        mock_config.get.side_effect = lambda name, default=None: config.get(name, default)
+
+        expected = {"tags": [("test-project/env", "dev"), ("test-project/team", "data")]}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        # Compare as sets since tag order depends on dictionary ordering
+        self.assertEqual(set(actual["tags"]), set(expected["tags"]))
+
+    def test_get_common_options_resource_tags_empty(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "resource_tags": {},
+        }
+        mock_config.get.side_effect = lambda name, default=None: config.get(name, default)
+
+        expected = {}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        self.assertEqual(expected, actual)
+
+    def test_get_common_options_resource_tags_and_labels(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "labels": {"label_key": "label_value"},
+            "resource_tags": {"test-project/tag_key": "tag_value"},
+        }
+        mock_config.get.side_effect = lambda name, default=None: config.get(name, default)
+
+        expected_labels = [("label_key", "label_value")]
+        expected_tags = [("test-project/tag_key", "tag_value")]
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+
+        self.assertEqual(set(actual["labels"]), set(expected_labels))
+        self.assertEqual(set(actual["tags"]), set(expected_tags))
+
+    def test_get_common_options_resource_tags_none(self):
+        adapter = self.get_adapter("oauth")
+        mock_config = create_autospec(RuntimeConfigObject)
+        config = {
+            "resource_tags": None,
+        }
+        mock_config.get.side_effect = lambda name, default=None: config.get(name, default)
+
+        expected = {}
+        actual = adapter.get_common_options(mock_config, node={}, temporary=False)
+        self.assertEqual(expected, actual)
+
 
 class TestBigQueryFilterCatalog(unittest.TestCase):
     def test__catalog_filter_table(self):
@@ -827,6 +1005,33 @@ class TestBigQueryFilterCatalog(unittest.TestCase):
             assert isinstance(row["table_database"], str)
             assert isinstance(row["table_name"], str)
             assert isinstance(row["something"], decimal.Decimal)
+
+
+class TestBigQueryCatalogRelationsByInfoSchema(BaseTestBigQueryAdapter):
+    def test_filters_out_nonexistent_schemas(self):
+        adapter = self.get_adapter("oauth")
+        adapter.check_schema_exists = MagicMock(
+            side_effect=lambda database, schema: schema == "real_dataset"
+        )
+
+        normal_relation = BigQueryRelation.create(
+            database="test-project",
+            schema="real_dataset",
+            identifier="my_table",
+        )
+        info_schema_source = BigQueryRelation.create(
+            database="test-project",
+            schema="region-us.INFORMATION_SCHEMA",
+            identifier="COLUMN_FIELD_PATHS",
+        )
+
+        result = adapter._get_catalog_relations_by_info_schema(
+            [normal_relation, info_schema_source]
+        )
+
+        schemas_in_result = {info.schema for info in result.keys()}
+        assert "real_dataset" in schemas_in_result
+        assert "region-us.INFORMATION_SCHEMA" not in schemas_in_result
 
 
 class TestBigQueryAdapterConversions(TestAdapterConversions):
@@ -993,3 +1198,63 @@ def test_sanitize_label_length(label_length):
         random.choice(string.ascii_uppercase + string.digits) for i in range(label_length)
     )
     assert len(_sanitize_label(random_string)) <= _VALIDATE_LABEL_LENGTH_LIMIT
+
+
+class TestPartitionConfigRenderWrappedInt64Range:
+    """Tests for render_wrapped() with int64 range partitions.
+
+    For int64 range partitions with an interval greater than 1, render_wrapped
+    normalizes field values to their partition start value, preventing excessively
+    large arrays when computing partitions for replacement in insert_overwrite.
+    """
+
+    @pytest.mark.parametrize("interval", [1, "1"])
+    def test_int64_range_with_interval_one_returns_raw_field(self, interval):
+        config = PartitionConfig.parse(
+            {
+                "field": "period",
+                "data_type": "int64",
+                "range": {"start": 201000, "end": 204999, "interval": interval},
+            }
+        )
+        assert config.render_wrapped() == "period"
+        assert config.render_wrapped(alias="DBT_INTERNAL_DEST") == "DBT_INTERNAL_DEST.period"
+
+    def test_int64_range_normalizes_to_partition_start(self):
+        """Values should be normalized using: value - MOD(value - start, interval)."""
+        config = PartitionConfig.parse(
+            {
+                "field": "partkey",
+                "data_type": "int64",
+                "range": {"start": 0, "end": 100000, "interval": 1000},
+            }
+        )
+        result = config.render_wrapped()
+        assert result == "(partkey - MOD(partkey - 0, 1000))"
+
+    def test_int64_range_with_nonzero_start(self):
+        config = PartitionConfig.parse(
+            {
+                "field": "id",
+                "data_type": "int64",
+                "range": {"start": 100, "end": 10000, "interval": 500},
+            }
+        )
+        result = config.render_wrapped()
+        assert result == "(id - MOD(id - 100, 500))"
+
+    def test_int64_range_with_alias(self):
+        config = PartitionConfig.parse(
+            {
+                "field": "partkey",
+                "data_type": "int64",
+                "range": {"start": 0, "end": 100000, "interval": 1000},
+            }
+        )
+        result = config.render_wrapped(alias="DBT_INTERNAL_DEST")
+        assert result == "(DBT_INTERNAL_DEST.partkey - MOD(DBT_INTERNAL_DEST.partkey - 0, 1000))"
+
+    def test_int64_without_range_returns_raw_field(self):
+        """int64 without range config should return the raw field name."""
+        config = PartitionConfig(field="id", data_type="int64")
+        assert config.render_wrapped() == "id"
