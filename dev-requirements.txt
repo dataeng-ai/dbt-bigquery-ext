@@ -6,7 +6,7 @@ git+https://github.com/dbt-labs/dbt-core.git@1.9.latest#egg=dbt-core&subdirector
 
 # dev
 ddtrace==2.3.0
-pre-commit~=3.7.0
+pre-commit~=4.6.2
 pytest~=7.4
 pytest-csv~=3.0
 pytest-dotenv~=0.5.2
