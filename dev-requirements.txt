@@ -16,5 +16,5 @@ tox~=4.11
 
 # build
 bumpversion~=0.6.0
-twine~=5.1
+twine~=7.0
 wheel~=0.43
