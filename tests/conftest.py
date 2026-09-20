@@ -29,9 +29,9 @@ def oauth_target():
     return {
         "type": "bigquery",
         "method": "oauth",
-        "threads": 1,
+        "threads": 4,
         "job_retries": 2,
-        "dataproc_region": os.getenv("DATAPROC_REGION"),
+        "compute_region": os.getenv("COMPUTE_REGION") or os.getenv("DATAPROC_REGION"),
         "dataproc_cluster_name": os.getenv("DATAPROC_CLUSTER_NAME"),
         "gcs_bucket": os.getenv("GCS_BUCKET"),
     }
@@ -42,16 +42,18 @@ def service_account_target():
     if _is_base64(credentials_json_str):
         credentials_json_str = _base64_to_string(credentials_json_str)
     credentials = json.loads(credentials_json_str)
-    project_id = credentials.get("project_id")
+    project_id = os.getenv("BIGQUERY_TEST_PROJECT") or credentials.get("project_id")
+    execution_project = os.getenv("BIGQUERY_TEST_EXECUTION_PROJECT") or project_id
     return {
         "type": "bigquery",
         "method": "service-account-json",
-        "threads": 1,
+        "threads": 4,
         "job_retries": 2,
         "project": project_id,
+        "execution_project": execution_project,
         "keyfile_json": credentials,
         # following 3 for python model
-        "dataproc_region": os.getenv("DATAPROC_REGION"),
+        "compute_region": os.getenv("COMPUTE_REGION") or os.getenv("DATAPROC_REGION"),
         "dataproc_cluster_name": os.getenv(
             "DATAPROC_CLUSTER_NAME"
         ),  # only needed for cluster submission method
