@@ -478,14 +478,14 @@ class BigQueryConnectionManager(BaseConnectionManager):
         sql = self._add_query_comment(sql)
 
         if not variable_sets:
-            print("execute_ext: variable_set_values is empty; nothing to run")
+            logger.debug("execute_ext: variable_set_values is empty; nothing to run")
             return (
                 BigQueryAdapterResponse(_message="OK (0 parameterized queries)"),
                 agate_helper.empty_table(),
             )
 
         pool_size = resolve_worker_pool_size(worker_pool_size, len(variable_sets))
-        print(
+        logger.debug(
             f"execute_ext: starting {len(variable_sets)} parameterized quer"
             f"{'y' if len(variable_sets) == 1 else 'ies'} "
             f"with worker_pool_size={worker_pool_size} (resolved={pool_size})"
@@ -510,12 +510,14 @@ class BigQueryConnectionManager(BaseConnectionManager):
             if parent_reservation is not None:
                 conn._bq_model_reservation = parent_reservation
 
-            print(f"execute_ext: starting execution for var set [{index}]: {dict(var_set)}")
+            logger.debug(
+                f"execute_ext: starting execution for var set [{index}]: {dict(var_set)}"
+            )
             attempt_state = {"last": 0}
 
             def _on_attempt(n: int) -> None:
                 if n > 1:
-                    print(
+                    logger.debug(
                         f"execute_ext: retried var set [{index}] "
                         f"(attempt {n}) params={dict(var_set)}"
                     )
@@ -532,13 +534,13 @@ class BigQueryConnectionManager(BaseConnectionManager):
                 response, table = self._response_from_query_job(
                     query_job, iterator, fetch=bool(fetch)
                 )
-                print(
+                logger.debug(
                     f"execute_ext: completed var set [{index}] "
                     f"job_id={response.job_id} message={response._message}"
                 )
                 return index, response, table, None
             except BaseException as exc:
-                print(f"execute_ext: failed var set [{index}]: {exc}")
+                logger.debug(f"execute_ext: failed var set [{index}]: {exc}")
                 return index, None, None, exc
             finally:
                 self.release()
@@ -557,7 +559,7 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
         succeeded = len(results)
         failed = len(errors)
-        print(
+        logger.debug(
             f"execute_ext: finished batch — succeeded={succeeded} "
             f"failed={failed} total={len(variable_sets)}"
         )
