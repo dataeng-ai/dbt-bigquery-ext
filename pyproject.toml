@@ -4,15 +4,25 @@ build-backend = "hatchling.build"
 
 [project]
 dynamic = ["version"]
-name = "dbt-bigquery"
-description = "The BigQuery adapter plugin for dbt"
+name = "dbt-bigquery-ext"
+description = "DataEng AI fork of dbt-bigquery with execute_ext (parameterized parallel queries) and other extensions. Drop-in replacement for dbt-bigquery (same import path dbt.adapters.bigquery)."
 readme = "README.md"
-keywords = ["dbt", "adapter", "adapters", "database", "elt", "dbt-core", "dbt Core", "dbt Cloud", "dbt Labs", "bigquery", "google"]
+keywords = [
+    "dbt",
+    "adapter",
+    "adapters",
+    "database",
+    "elt",
+    "dbt-core",
+    "bigquery",
+    "google",
+    "dataeng",
+]
 requires-python = ">=3.10.0"
-authors = [{ name = "dbt Labs", email = "info@dbtlabs.com" }]
-maintainers = [{ name = "dbt Labs", email = "info@dbtlabs.com" }]
+authors = [{ name = "DataEng AI", email = "dataeng.ai@gmail.com" }]
+maintainers = [{ name = "DataEng AI", email = "dataeng.ai@gmail.com" }]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
@@ -22,6 +32,8 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
+# Drop-in replacement: uninstall upstream first if both are installed.
+# pip install "dbt-bigquery-ext"  (provides dbt.adapters.bigquery)
 dependencies = [
     "dbt-common>=1.10,<2.0",
     "dbt-adapters>=1.24.4,<2.0",
@@ -40,11 +52,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-bigquery"
-Documentation = "https://docs.getdbt.com"
-Repository = "https://github.com/dbt-labs/dbt-adapters.git#subdirectory=dbt-bigquery"
-Issues = "https://github.com/dbt-labs/dbt-adapters/issues"
-Changelog = "https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-bigquery/CHANGELOG.md"
+Homepage = "https://github.com/dataeng-ai/dbt-bigquery-ext"
+Documentation = "https://github.com/dataeng-ai/dbt-bigquery-ext"
+Repository = "https://github.com/dataeng-ai/dbt-bigquery-ext"
+Issues = "https://github.com/dataeng-ai/dbt-bigquery-ext/issues"
+Changelog = "https://github.com/dataeng-ai/dbt-bigquery-ext/blob/main/CHANGELOG.md"
+Upstream = "https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-bigquery"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/functional"]

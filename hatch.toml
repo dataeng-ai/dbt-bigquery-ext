@@ -54,15 +54,15 @@ check-all = [
 ]
 check-wheel = [
     "twine check dist/*",
-    "find ./dist/dbt_bigquery-*.whl -maxdepth 1 -type f | xargs python -m pip install --force-reinstall --find-links=dist/",
-    "pip freeze | grep dbt-bigquery",
+    "find ./dist/dbt_bigquery_ext-*.whl -maxdepth 1 -type f | xargs python -m pip install --force-reinstall --find-links=dist/",
+    "pip freeze | grep dbt-bigquery-ext",
 ]
 check-sdist = [
     "check-wheel-contents dist/*.whl --ignore W007,W008",
-    "find ./dist/dbt_bigquery-*.gz -maxdepth 1 -type f | xargs python -m pip install --force-reinstall --find-links=dist/",
-    "pip freeze | grep dbt-bigquery",
+    "find ./dist/dbt_bigquery_ext-*.gz -maxdepth 1 -type f | xargs python -m pip install --force-reinstall --find-links=dist/",
+    "pip freeze | grep dbt-bigquery-ext",
 ]
-docker-prod = "docker build -f docker/Dockerfile -t dbt-bigquery ."
+docker-prod = "docker build -f docker/Dockerfile -t dbt-bigquery-ext ."
 
 [envs.ci]
 pre-install-commands = [
