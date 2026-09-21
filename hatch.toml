@@ -1,5 +1,6 @@
 [version]
 path = "src/dbt/adapters/bigquery/__version__.py"
+pattern = "(?m)^pypi_version = ['\"](?P<version>[^'\"]+)['\"]"
 
 [build.targets.wheel]
 packages = ["src/dbt"]

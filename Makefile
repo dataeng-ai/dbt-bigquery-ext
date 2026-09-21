@@ -1,6 +1,6 @@
-# First release tag should match __version__.py, e.g. v1.12.1.post1
+# Tag the PyPI release (pypi_version), not the dbt semver string.
 tag:
-	@v=$$(python3 -c "import pathlib,re; t=pathlib.Path('src/dbt/adapters/bigquery/__version__.py').read_text(); print(re.search(r'version\s*=\s*\"([^\"]+)\"', t).group(1))"); \
+	@v=$$(python3 -c "import pathlib,re; t=pathlib.Path('src/dbt/adapters/bigquery/__version__.py').read_text(); print(re.search(r'pypi_version\s*=\s*\"([^\"]+)\"', t).group(1))"); \
 	git tag "v$$v"; \
 	git push origin "v$$v"
 
