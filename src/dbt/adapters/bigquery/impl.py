@@ -1428,6 +1428,38 @@ class BigQueryAdapter(BaseAdapter):
                 f'Got an unexpected location value of "{location}"'
             )
 
+    @available.parse(lambda *a, **k: ({"_message": "OK"}, None))
+    def execute_ext(
+        self,
+        sql: str,
+        auto_begin: bool = False,
+        fetch: bool = False,
+        limit: Optional[int] = None,
+        variable_set_values: Optional[List[Dict[str, Any]]] = None,
+        worker_pool_size: int = 0,
+        variable_set_types: Optional[Dict[str, str]] = None,
+    ) -> Tuple[AdapterResponse, Any]:
+        """Jinja-callable extended execute with parameterized parallel queries.
+
+        Example::
+
+            {% set res, table = adapter.execute_ext(
+                compiled_code,
+                variable_set_values=[{"store_id": 1}, {"store_id": 2}],
+                variable_set_types={"store_id": "INT64"},
+                worker_pool_size=0,
+            ) %}
+        """
+        return self.connections.execute_ext(
+            sql=sql,
+            auto_begin=auto_begin,
+            fetch=fetch,
+            limit=limit,
+            variable_set_values=variable_set_values,
+            worker_pool_size=worker_pool_size,
+            variable_set_types=variable_set_types,
+        )
+
     # This is used by the test suite
     @available
     def run_sql_for_tests(self, sql, fetch, conn=None):

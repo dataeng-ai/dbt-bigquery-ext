@@ -1,12 +1,23 @@
 from collections import defaultdict
-from concurrent.futures import TimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from multiprocessing.context import SpawnContext
 import re
 import time
-from typing import Callable, Dict, Hashable, List, Optional, Tuple, TYPE_CHECKING
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TYPE_CHECKING,
+)
 import uuid
 
 from google.auth.exceptions import RefreshError
@@ -40,6 +51,11 @@ from dbt.adapters.events.types import SQLQuery, SQLQueryStatus
 from dbt.adapters.exceptions.connection import FailedToConnectError
 from dbt.adapters.bigquery.clients import create_bigquery_client
 from dbt.adapters.bigquery.credentials import Priority
+from dbt.adapters.bigquery.query_parameters import (
+    build_query_parameters,
+    resolve_worker_pool_size,
+    validate_variable_set_values,
+)
 from dbt.adapters.bigquery.retry import RetryFactory
 
 if TYPE_CHECKING:
@@ -256,6 +272,8 @@ class BigQueryConnectionManager(BaseConnectionManager):
         use_legacy_sql=False,
         limit: Optional[int] = None,
         dry_run: bool = False,
+        query_parameters: Optional[List[Any]] = None,
+        on_attempt: Optional[Callable[[int], None]] = None,
     ):
         conn = self.get_thread_connection()
 
@@ -265,11 +283,18 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
         labels["dbt_invocation_id"] = get_invocation_id()
 
+        # Parameterized queries require GoogleSQL.
+        if query_parameters:
+            use_legacy_sql = False
+
         job_params = {
             "use_legacy_sql": use_legacy_sql,
             "labels": labels,
             "dry_run": dry_run,
         }
+
+        if query_parameters:
+            job_params["query_parameters"] = query_parameters
 
         priority = conn.credentials.priority
         if priority == Priority.Batch:
@@ -297,12 +322,18 @@ class BigQueryConnectionManager(BaseConnectionManager):
             # Mint the job_id once, outside the retry closure, so a re-entry
             # resubmits the same job instead of spawning a duplicate.
             job_id = self.generate_job_id()
+            attempt_num = {"n": 0}
 
             def _execute_with_retry():
+                attempt_num["n"] += 1
+                if on_attempt is not None:
+                    on_attempt(attempt_num["n"])
+                # Copy job_params so timeout mutation in _query_and_results
+                # does not leak across retry attempts / parallel workers.
                 return self._query_and_results(
                     conn,
                     sql,
-                    job_params,
+                    dict(job_params),
                     job_id,
                     limit=limit,
                 )
@@ -411,6 +442,214 @@ class BigQueryConnectionManager(BaseConnectionManager):
             slot_ms=slot_ms,
         )
 
+        return response, table
+
+    def execute_ext(
+        self,
+        sql,
+        auto_begin=False,
+        fetch=None,
+        limit: Optional[int] = None,
+        variable_set_values: Optional[Sequence[Mapping[str, Any]]] = None,
+        worker_pool_size: int = 0,
+        variable_set_types: Optional[Mapping[str, str]] = None,
+    ) -> Tuple[BigQueryAdapterResponse, "agate.Table"]:
+        """Execute SQL once, or many times in parallel with query parameters.
+
+        When ``variable_set_values`` is None / omitted, behaves like ``execute``.
+        Otherwise runs ``len(variable_set_values)`` parameterized jobs concurrently.
+
+        worker_pool_size:
+          * 0  — auto parallelism (16 workers)
+          * -1 — one worker per variable set (unlimited relative to the batch)
+          * >0 — explicit pool size
+
+        Partial failures are not rolled back. If any job fails after all have
+        finished, a ``DbtRuntimeError`` is raised (overall status = failed).
+        Callers must use idempotent SQL or handle partial runs outside dbt.
+        """
+        from dbt_common.clients import agate_helper
+
+        # Fallback: no parameterized batch → regular execute.
+        if variable_set_values is None:
+            return self.execute(sql, auto_begin=auto_begin, fetch=fetch, limit=limit)
+
+        variable_sets = validate_variable_set_values(variable_set_values)
+        sql = self._add_query_comment(sql)
+
+        if not variable_sets:
+            print("execute_ext: variable_set_values is empty; nothing to run")
+            return (
+                BigQueryAdapterResponse(_message="OK (0 parameterized queries)"),
+                agate_helper.empty_table(),
+            )
+
+        pool_size = resolve_worker_pool_size(worker_pool_size, len(variable_sets))
+        print(
+            f"execute_ext: starting {len(variable_sets)} parameterized quer"
+            f"{'y' if len(variable_sets) == 1 else 'ies'} "
+            f"with worker_pool_size={worker_pool_size} (resolved={pool_size})"
+        )
+
+        # Preserve parent-thread connection attrs (timeout / reservation) for workers.
+        parent_conn = self.get_if_exists()
+        parent_timeout = getattr(parent_conn, "_bq_model_timeout", None) if parent_conn else None
+        parent_reservation = (
+            getattr(parent_conn, "_bq_model_reservation", None) if parent_conn else None
+        )
+
+        results: Dict[int, Tuple[BigQueryAdapterResponse, Any]] = {}
+        errors: Dict[int, BaseException] = {}
+
+        def _run_one(index: int, var_set: Mapping[str, Any]):
+            conn_name = f"execute_ext_{index}"
+            self.set_connection_name(conn_name)
+            conn = self.get_thread_connection()
+            if parent_timeout is not None:
+                conn._bq_model_timeout = parent_timeout
+            if parent_reservation is not None:
+                conn._bq_model_reservation = parent_reservation
+
+            print(f"execute_ext: starting execution for var set [{index}]: {dict(var_set)}")
+            attempt_state = {"last": 0}
+
+            def _on_attempt(n: int) -> None:
+                if n > 1:
+                    print(
+                        f"execute_ext: retried var set [{index}] "
+                        f"(attempt {n}) params={dict(var_set)}"
+                    )
+                attempt_state["last"] = n
+
+            try:
+                query_parameters = build_query_parameters(var_set, variable_set_types)
+                query_job, iterator = self.raw_execute(
+                    sql,
+                    limit=limit,
+                    query_parameters=query_parameters,
+                    on_attempt=_on_attempt,
+                )
+                response, table = self._response_from_query_job(
+                    query_job, iterator, fetch=bool(fetch)
+                )
+                print(
+                    f"execute_ext: completed var set [{index}] "
+                    f"job_id={response.job_id} message={response._message}"
+                )
+                return index, response, table, None
+            except BaseException as exc:
+                print(f"execute_ext: failed var set [{index}]: {exc}")
+                return index, None, None, exc
+            finally:
+                self.release()
+
+        with ThreadPoolExecutor(max_workers=pool_size) as executor:
+            futures = [
+                executor.submit(_run_one, idx, var_set)
+                for idx, var_set in enumerate(variable_sets)
+            ]
+            for future in as_completed(futures):
+                index, response, table, exc = future.result()
+                if exc is not None:
+                    errors[index] = exc
+                else:
+                    results[index] = (response, table)
+
+        succeeded = len(results)
+        failed = len(errors)
+        print(
+            f"execute_ext: finished batch — succeeded={succeeded} "
+            f"failed={failed} total={len(variable_sets)}"
+        )
+
+        if errors:
+            details = "; ".join(
+                f"[{idx}] {errors[idx]}" for idx in sorted(errors)
+            )
+            raise DbtRuntimeError(
+                f"execute_ext incomplete: {failed}/{len(variable_sets)} queries failed "
+                f"(partial runs are not rolled back). Failures: {details}"
+            )
+
+        # Aggregate responses; multi-query fetch returns an empty table.
+        ordered = [results[i][0] for i in sorted(results)]
+        total_bytes = sum(r.bytes_processed or 0 for r in ordered)
+        total_billed = sum(r.bytes_billed or 0 for r in ordered)
+        total_slots = sum(r.slot_ms or 0 for r in ordered)
+        total_rows = sum(r.rows_affected or 0 for r in ordered if r.rows_affected is not None)
+        job_ids = ",".join(r.job_id for r in ordered if r.job_id)
+
+        aggregated = BigQueryAdapterResponse(
+            _message=f"OK ({succeeded} parameterized queries)",
+            rows_affected=total_rows if total_rows else None,
+            code="EXECUTE_EXT",
+            bytes_processed=total_bytes or None,
+            bytes_billed=total_billed or None,
+            location=ordered[0].location if ordered else None,
+            project_id=ordered[0].project_id if ordered else None,
+            job_id=job_ids or None,
+            slot_ms=total_slots or None,
+        )
+        return aggregated, agate_helper.empty_table()
+
+    def _response_from_query_job(
+        self, query_job, iterator, fetch: bool = False
+    ) -> Tuple[BigQueryAdapterResponse, "agate.Table"]:
+        """Build an AdapterResponse (+ optional agate table) from a finished QueryJob."""
+        from dbt_common.clients import agate_helper
+
+        if fetch:
+            table = self.get_table_from_response(iterator)
+        else:
+            table = agate_helper.empty_table()
+
+        message = "OK"
+        code = None
+        num_rows = None
+
+        if query_job.statement_type == "CREATE_VIEW":
+            code = "CREATE VIEW"
+        elif query_job.statement_type == "CREATE_TABLE_AS_SELECT":
+            code = "CREATE TABLE"
+            conn = self.get_thread_connection()
+            client = conn.handle
+            query_table = client.get_table(query_job.destination)
+            num_rows = query_table.num_rows
+        elif query_job.statement_type == "SCRIPT":
+            code = "SCRIPT"
+        elif query_job.statement_type in ["INSERT", "DELETE", "MERGE", "UPDATE"]:
+            code = query_job.statement_type
+            num_rows = query_job.num_dml_affected_rows
+        elif query_job.statement_type == "SELECT":
+            code = "SELECT"
+            conn = self.get_thread_connection()
+            client = conn.handle
+            query_table = client.get_table(query_job.destination)
+            num_rows = query_table.num_rows
+
+        bytes_processed = query_job.total_bytes_processed
+        bytes_billed = query_job.total_bytes_billed
+        slot_ms = query_job.slot_millis
+        processed_bytes = self.format_bytes(bytes_processed)
+        if num_rows is not None:
+            num_rows_formatted = self.format_rows_number(num_rows)
+            message = f"{code} ({num_rows_formatted} rows, {processed_bytes} processed)"
+        elif bytes_processed is not None:
+            message = f"{code} ({processed_bytes} processed)"
+        else:
+            message = f"{code}"
+
+        response = BigQueryAdapterResponse(
+            _message=message,
+            rows_affected=num_rows,
+            code=code,
+            bytes_processed=bytes_processed,
+            bytes_billed=bytes_billed,
+            location=query_job.location,
+            project_id=query_job.project,
+            job_id=query_job.job_id,
+            slot_ms=slot_ms,
+        )
         return response, table
 
     def dry_run(self, sql: str) -> BigQueryAdapterResponse:
