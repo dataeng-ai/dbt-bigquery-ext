@@ -94,22 +94,26 @@ dbt run --select orders_by_store --debug
 
 ## Versioning
 
-Versions follow PEP 440 as:
+Two version strings, because dbt and PyPI do not accept the same syntax.
+
+| String | Where | Example | Why |
+| --- | --- | --- | --- |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post2` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post2` | DataEng release N on top of upstream `1.12.1` |
+
+`pypi_version` scheme:
 
 ```text
 <upstream dbt-bigquery version>.post<N>
 ```
 
-Examples:
-
-| Version | Meaning |
+| PyPI version | Meaning |
 | --- | --- |
-| `1.12.1.post1` | First DataEng release on top of upstream `1.12.1` |
-| `1.12.1.post2` | Second DataEng-only release, still based on `1.12.1` |
-| `1.13.0.post1` | Rebased onto upstream `1.13.0`, first DataEng release |
+| `1.12.1.post1` | First DataEng release on upstream `1.12.1` |
+| `1.12.1.post2` | Second DataEng-only release, same upstream base |
+| `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
-Avoid schemes like `1.12-0.0.1` (not valid PEP 440) or local versions
-(`1.12.1+dataeng.1`) — those cannot be uploaded to PyPI.
+On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.
 
 ## Upstream
 
