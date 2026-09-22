@@ -11,4 +11,4 @@
 # `version` to the new upstream release and bump `pypi_version` to
 # "<upstream>.post1". Do not put ".postN" into `version`.
 version = "1.12.1"
-pypi_version = "1.12.1.post2"
+pypi_version = "1.12.1.post3"

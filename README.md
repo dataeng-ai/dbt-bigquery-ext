@@ -16,16 +16,40 @@ pip install dbt-bigquery-ext
 
 ## execute_ext
 
-Runs the model's main SQL once per variable set, in parallel, as a [BigQuery parameterized query](https://docs.cloud.google.com/bigquery/docs/parameterized-queries) (`@name` placeholders). Built-in materializations (`table`, `view`, `incremental`, and so on) pick this up automatically: the adapter overrides the core `statement` macro and, when `config.execute_ext` is set, sends only the `main` statement through `adapter.execute_ext`. Helper SQL (`run_query`, temp relations, alters) stays on the normal single `execute` path.
+Runs the model's main SQL once per variable set, in parallel, as a [BigQuery parameterized query](https://docs.cloud.google.com/bigquery/docs/parameterized-queries) (`@name` placeholders). The adapter overrides the core `statement` macro and, when `config.execute_ext` is set, sends only the `main` statement through `adapter.execute_ext`.
 
-Without `execute_ext` config, behavior matches upstream `dbt-bigquery`.
+`execute_ext` is allowed only on materializations `incremental_ext` and `script`. Any other materialization raises.
+
+Without `execute_ext` config, behavior matches upstream `dbt-bigquery`. `incremental_ext` and `script` are still available and run their main SQL once.
+
+### incremental_ext
+
+Merge-only incremental materialization. It does not `CREATE OR REPLACE` the target and it does not build a shared dataset `__dbt_tmp`.
+
+Serial, once per run:
+
+1. On `--full-refresh`, `DROP` the existing relation. Truncate would keep the old partition and cluster spec and fail when those change.
+2. `CREATE TABLE IF NOT EXISTS <target> AS SELECT * FROM (<model>) WHERE FALSE` so a missing table is created empty, with the current partition and cluster config.
+3. When `on_schema_change` is not `ignore`, create a dataset temp the same empty way, apply the schema change to the target, then drop the temp.
+
+The `main` statement is one BigQuery script per variable set:
+
+```sql
+create temp table _dbt_ext_src as (
+  <model sql, with @parameters>
+);
+merge into <target> ... using (select * from _dbt_ext_src) ...
+```
+
+`CREATE TEMP TABLE` lives in that script's job, so concurrent `execute_ext` workers do not see each other's temp tables. Each merge writes only its own rows into the shared target. The model needs `unique_key`. `incremental_strategy` must be `merge` (the default).
 
 ### Model config
 
 ```sql
 -- models/orders_by_store.sql
 {{ config(
-    materialized="table",
+    materialized="incremental_ext",
+    unique_key="order_id",
     execute_ext={
         "variable_set_values": [
             {"store_id": 1, "region": "us"},
@@ -42,9 +66,32 @@ where store_id = @store_id
   and region = @region
 ```
 
-`statement('main')` submits `create or replace table … as ( <model sql> )`, so `@store_id` and `@region` are bound on that statement. Each dict in `variable_set_values` is one query. All sets must be idempotent: a failure does not roll back sets that already succeeded.
+Each dict in `variable_set_values` is one script. The serial DDL (empty create, schema probe) binds only the first set so `@store_id` / `@region` are valid there too. Merges must be idempotent: a failure does not roll back sets that already succeeded.
 
-The same config block works in `dbt_project.yml` or a `schema.yml` `config:` entry.
+The same `execute_ext` block works in `dbt_project.yml` or a `schema.yml` `config:` entry.
+
+### script
+
+`script` runs `compiled_code` as the `main` statement and returns no relation. Use it for a hand-written BigQuery script. With `execute_ext`, that script is fanned out the same way. Give each run its own `CREATE TEMP TABLE` if it stages rows before writing.
+
+```sql
+{{ config(
+    materialized="script",
+    execute_ext={
+        "variable_set_values": [{"store_id": 1}, {"store_id": 2}],
+        "variable_set_types": {"store_id": "INT64"},
+    },
+) }}
+
+create temp table _batch as (
+  select * from {{ source("raw", "orders") }} where store_id = @store_id
+);
+merge into {{ this }} as t
+using _batch as s
+on t.order_id = s.order_id
+when matched then update set t.amount = s.amount
+when not matched then insert (order_id, amount) values (s.order_id, s.amount)
+```
 
 ### Direct call from a macro
 
@@ -98,8 +145,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post2` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post2` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post3` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post3` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -111,6 +158,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | --- | --- |
 | `1.12.1.post1` | First DataEng release on upstream `1.12.1` |
 | `1.12.1.post2` | Second DataEng-only release, same upstream base |
+| `1.12.1.post3` | Third DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.
