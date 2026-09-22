@@ -113,6 +113,72 @@ when not matched then insert (order_id, amount) values (s.order_id, s.amount)
 
 Omit `variable_set_values` (or pass `none`) and `execute_ext` falls back to a normal `execute`.
 
+## Cloud SQL gateway (checkpoints)
+
+Optional SQLMesh-style state backend on the BigQuery profile. Uses the [Cloud SQL Python Connector](https://github.com/GoogleCloudPlatform/cloud-sql-python-connector) with **IAM DB auth** (no password). Intended to replace the `dbt-webhook` → Cloud Function → Postgres path for delta checkpoints (`public.dbt_model_log`).
+
+### Profile
+
+```yaml
+my_target:
+  type: bigquery
+  method: oauth  # or service-account / impersonate_service_account
+  project: simbe-data-dev
+  dataset: analytics
+  gateway:
+    cloudsql:
+      instance_connection_name: "simbe-data-prd:us-central1:metadata"
+      database: metadata
+      ip_type: private          # private | public | psc
+      schema_name: public
+      # user: "dbt-runner@simbe-data-prd.iam"  # optional; derived from SA / impersonation
+      init_on_connect: true     # ensure schema on first BQ connection
+      auto_migrate: true        # reserved; today only CREATE IF NOT EXISTS
+```
+
+IAM DB user for a service account is the SA email with `.gserviceaccount.com` stripped (`name@project.iam`). The runner needs `roles/cloudsql.client` + Cloud SQL Instance User on that instance.
+
+### Startup
+
+On the first BigQuery connection (when `init_on_connect: true`), the adapter connects to Cloud SQL and:
+
+1. Checks for `dbt_model_log`
+2. If missing → `CREATE TABLE` + index (same DDL as Simbe `data-tf` `pg_schema/dbt_model_log.sql`)
+3. If present → skip
+
+Force early init from `dbt_project.yml`:
+
+```yaml
+on-run-start:
+  - "{{ adapter.gateway_ensure() }}"
+```
+
+### Adapter / macros
+
+| Call | Role |
+| --- | --- |
+| `adapter.gateway_ensure()` | Connect + ensure tables |
+| `adapter.gateway_get_checkpoint(db, schema, table)` | Latest successful row (for pre-hooks) |
+| `adapter.gateway_set_checkpoint(...)` | Insert row (replaces `analytics.set_checkpoint` UDF) |
+
+Jinja wrappers: `gateway_ensure`, `gateway_get_checkpoint`, `gateway_set_checkpoint`.
+
+Example commit (post-hook), after you switch off the remote UDF:
+
+```sql
+{% do adapter.gateway_set_checkpoint(
+    invocation_id,
+    this.database,
+    this.schema,
+    this.identifier,
+    run_started_at | string,
+    node_started_at | string,
+    modules.datetime.datetime.utcnow() | string,
+    delta_start_time | string,
+    delta_end_time | string,
+) %}
+```
+
 ### worker_pool_size
 
 | Value | Workers |
@@ -145,8 +211,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post3` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post3` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post4` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post4` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -159,6 +225,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | `1.12.1.post1` | First DataEng release on upstream `1.12.1` |
 | `1.12.1.post2` | Second DataEng-only release, same upstream base |
 | `1.12.1.post3` | Third DataEng-only release, same upstream base |
+| `1.12.1.post4` | Fourth DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.

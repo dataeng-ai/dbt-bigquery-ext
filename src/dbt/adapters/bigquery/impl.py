@@ -240,6 +240,25 @@ class BigQueryAdapter(BaseAdapter):
         self.connections: BigQueryConnectionManager = self.connections
         self.add_catalog_integration(constants.DEFAULT_INFO_SCHEMA_CATALOG)
         self.add_catalog_integration(constants.DEFAULT_ICEBERG_CATALOG)
+        self._gateway = None
+        self._gateway_ensured = False
+        self._gateway_lock = threading.RLock()
+
+    def acquire_connection(self, name=None):
+        connection = super().acquire_connection(name)
+        # First real warehouse connection ≈ dbt command start: ensure meta DB.
+        try:
+            from dbt.adapters.bigquery.gateway import parse_gateway_config
+
+            gw_cfg = parse_gateway_config(getattr(self.config.credentials, "gateway", None))
+            if gw_cfg is not None and gw_cfg.init_on_connect and not self._gateway_ensured:
+                self._ensure_gateway_ready()
+        except Exception as exc:
+            # Surface clearly — a misconfigured gateway should fail the run early.
+            raise dbt_common.exceptions.DbtRuntimeError(
+                f"gateway.cloudsql init failed during connection open: {exc}"
+            ) from exc
+        return connection
 
     def _v2_to_v1_type(self, catalog_type: str) -> str:
         return self._V2_TO_V1_TYPE.get(catalog_type, catalog_type)
@@ -1458,6 +1477,88 @@ class BigQueryAdapter(BaseAdapter):
             variable_set_values=variable_set_values,
             worker_pool_size=worker_pool_size,
             variable_set_types=variable_set_types,
+        )
+
+    # --- Cloud SQL gateway (checkpoints / metadata) ---
+
+    def _get_gateway(self):
+        from dbt.adapters.bigquery.gateway import CloudSqlGateway, parse_gateway_config
+
+        with self._gateway_lock:
+            if self._gateway is not None:
+                return self._gateway
+            config = parse_gateway_config(getattr(self.config.credentials, "gateway", None))
+            if config is None:
+                raise dbt_common.exceptions.DbtRuntimeError(
+                    "No gateway.cloudsql configured in the BigQuery profile. "
+                    "Add gateway.cloudsql.instance_connection_name (and related fields) "
+                    "to enable checkpoint APIs."
+                )
+            self._gateway = CloudSqlGateway(self.config.credentials, config)
+            return self._gateway
+
+    def _ensure_gateway_ready(self) -> Dict[str, str]:
+        gateway = self._get_gateway()
+        with self._gateway_lock:
+            if self._gateway_ensured:
+                return {name: "exists" for name in ("dbt_model_log",)}
+            status = gateway.ensure_schema()
+            self._gateway_ensured = True
+            return status
+
+    @available.parse(lambda *a, **k: {})
+    def gateway_ensure(self) -> Dict[str, str]:
+        """Connect to Cloud SQL and create missing metadata tables (idempotent).
+
+        Call from ``on-run-start`` to force init at command start::
+
+            on-run-start:
+              - "{{ adapter.gateway_ensure() }}"
+        """
+        return self._ensure_gateway_ready()
+
+    @available.parse(lambda *a, **k: None)
+    def gateway_get_checkpoint(
+        self,
+        target_database: str,
+        target_schema: str,
+        target_table_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest successful checkpoint row for a model, or None."""
+        self._ensure_gateway_ready()
+        return self._get_gateway().get_checkpoint(
+            target_database, target_schema, target_table_name
+        )
+
+    @available.parse(lambda *a, **k: None)
+    def gateway_set_checkpoint(
+        self,
+        invocation_id: str,
+        target_database: str,
+        target_schema: str,
+        target_table_name: str,
+        run_started_at: str,
+        node_started_at: str,
+        node_finished_at: str,
+        delta_start_time: str,
+        delta_end_time: str,
+        success: bool = True,
+        full_refresh: Optional[bool] = None,
+    ) -> Any:
+        """Insert a checkpoint row into ``dbt_model_log`` (replaces set_checkpoint UDF)."""
+        self._ensure_gateway_ready()
+        return self._get_gateway().set_checkpoint(
+            invocation_id=invocation_id,
+            target_database=target_database,
+            target_schema=target_schema,
+            target_table_name=target_table_name,
+            run_started_at=run_started_at,
+            node_started_at=node_started_at,
+            node_finished_at=node_finished_at,
+            delta_start_time=delta_start_time,
+            delta_end_time=delta_end_time,
+            success=success,
+            full_refresh=full_refresh,
         )
 
     # This is used by the test suite

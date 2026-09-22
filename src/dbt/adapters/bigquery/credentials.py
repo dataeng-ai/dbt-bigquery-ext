@@ -109,6 +109,10 @@ class BigQueryCredentials(Credentials):
         default=None,
     )
 
+    # Optional SQLMesh-style state gateway (Cloud SQL Postgres via IAM).
+    # Shape: {cloudsql: {instance_connection_name, database, ...}}
+    gateway: Optional[Dict[str, Any]] = None
+
     scopes: Optional[Tuple[str, ...]] = (
         "https://www.googleapis.com/auth/bigquery",
         "https://www.googleapis.com/auth/cloud-platform",
@@ -169,6 +173,7 @@ class BigQueryCredentials(Credentials):
             "dataproc_cluster_name",
             "gcs_bucket",
             "dataproc_batch",
+            "gateway",
         )
 
     @classmethod
