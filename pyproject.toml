@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 dynamic = ["version"]
 name = "dbt-bigquery-ext"
-description = "DataEng AI fork of dbt-bigquery with execute_ext (parameterized parallel queries) and other extensions. Drop-in replacement for dbt-bigquery (same import path dbt.adapters.bigquery)."
+description = "DataEng AI fork of dbt-bigquery with execute_ext, Cloud SQL gateway checkpoints, and other extensions. Drop-in replacement for dbt-bigquery (same import path dbt.adapters.bigquery)."
 readme = "README.md"
 keywords = [
     "dbt",
@@ -49,6 +49,8 @@ dependencies = [
     "dbt-core>=1.10.0rc0,<2.0",
     "nbformat>=5.10.4",
     "google-cloud-aiplatform>=1.148.0",
+    # Cloud SQL IAM gateway (optional until gateway.cloudsql is configured)
+    "cloud-sql-python-connector[pg8000]>=1.12.0,<2.0",
 ]
 
 [project.urls]
