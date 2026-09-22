@@ -29,6 +29,15 @@ not fanned out across the variable set.
             ~ "optional variable_set_types, and optional worker_pool_size"
           ) %}
         {%- endif -%}
+        {%- set allowed_materializations = ['incremental_ext', 'script'] -%}
+        {%- set materialized = config.get('materialized') -%}
+        {%- if materialized not in allowed_materializations -%}
+          {% do exceptions.raise_compiler_error(
+            "config execute_ext is only supported for materializations "
+            ~ allowed_materializations | join(', ')
+            ~ " (got '" ~ materialized ~ "')"
+          ) %}
+        {%- endif -%}
         {%- set worker_pool_size = ext.get('worker_pool_size', 0) -%}
         {%- if worker_pool_size is none -%}
           {%- set worker_pool_size = 0 -%}
