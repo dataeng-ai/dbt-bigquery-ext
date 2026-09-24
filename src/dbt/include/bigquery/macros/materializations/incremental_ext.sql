@@ -98,12 +98,8 @@
 
 {% materialization incremental_ext, adapter='bigquery', supported_languages=['sql'] -%}
 
+  {# unique_key optional: omitted => insert-only MERGE (append), same as incremental. #}
   {%- set unique_key = config.get('unique_key') -%}
-  {%- if not unique_key -%}
-    {% do exceptions.raise_compiler_error(
-      "incremental_ext requires unique_key (merge is the only strategy)"
-    ) %}
-  {%- endif -%}
 
   {%- set strategy = config.get('incremental_strategy') or 'merge' -%}
   {%- if strategy != 'merge' -%}
