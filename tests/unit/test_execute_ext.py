@@ -1,5 +1,6 @@
 import datetime
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 from google.cloud.bigquery import ScalarQueryParameter
@@ -9,10 +10,14 @@ from dbt.adapters.bigquery.connections import BigQueryConnectionManager
 from dbt.adapters.bigquery.query_parameters import (
     AUTO_WORKER_POOL_SIZE,
     MAX_WORKER_POOL_SIZE,
+    bq_field_type_to_param_type,
     build_query_parameters,
     infer_scalar_type,
+    render_variable_set_relation,
     resolve_worker_pool_size,
+    validate_variable_set_source,
     validate_variable_set_values,
+    variable_sets_from_bq_rows,
 )
 
 
@@ -87,6 +92,66 @@ class TestQueryParameters(unittest.TestCase):
             validate_variable_set_values("nope")
         with self.assertRaises(DbtRuntimeError):
             validate_variable_set_values([1])
+
+    def test_validate_variable_set_source_xor(self):
+        validate_variable_set_source([{"a": 1}], None)
+        validate_variable_set_source(None, "project.dataset.table")
+        validate_variable_set_source(None, None)
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_variable_set_source([{"a": 1}], "project.dataset.table")
+        self.assertIn("only one", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_variable_set_source(
+                None, "project.dataset.table", variable_set_types={"a": "INT64"}
+            )
+        self.assertIn("variable_set_types", str(ctx.exception))
+
+    def test_bq_field_type_to_param_type(self):
+        self.assertEqual(bq_field_type_to_param_type("INTEGER"), "INT64")
+        self.assertEqual(bq_field_type_to_param_type("FLOAT"), "FLOAT64")
+        self.assertEqual(bq_field_type_to_param_type("BOOLEAN"), "BOOL")
+        self.assertEqual(bq_field_type_to_param_type("STRING"), "STRING")
+        with self.assertRaises(DbtRuntimeError):
+            bq_field_type_to_param_type("RECORD")
+        with self.assertRaises(DbtRuntimeError):
+            bq_field_type_to_param_type("ARRAY")
+
+    def test_render_variable_set_relation(self):
+        self.assertEqual(
+            render_variable_set_relation("`p`.`d`.`t`"), "`p`.`d`.`t`"
+        )
+        rel = Mock()
+        rel.render.return_value = "`p`.`d`.`t`"
+        self.assertEqual(render_variable_set_relation(rel), "`p`.`d`.`t`")
+        with self.assertRaises(DbtRuntimeError):
+            render_variable_set_relation("  ")
+
+    def test_variable_sets_from_bq_rows(self):
+        schema = [
+            SimpleNamespace(name="store_id", field_type="INTEGER", mode="NULLABLE"),
+            SimpleNamespace(name="region", field_type="STRING", mode="NULLABLE"),
+        ]
+        rows = [
+            {"store_id": 1, "region": "us"},
+            {"store_id": 2, "region": "eu"},
+        ]
+        values, types = variable_sets_from_bq_rows(rows, schema)
+        self.assertEqual(
+            values, [{"store_id": 1, "region": "us"}, {"store_id": 2, "region": "eu"}]
+        )
+        self.assertEqual(types, {"store_id": "INT64", "region": "STRING"})
+
+    def test_variable_sets_from_bq_rows_null_raises(self):
+        schema = [SimpleNamespace(name="store_id", field_type="INTEGER", mode="NULLABLE")]
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            variable_sets_from_bq_rows([{"store_id": None}], schema)
+        self.assertIn("NULL", str(ctx.exception))
+
+    def test_variable_sets_from_bq_rows_repeated_raises(self):
+        schema = [SimpleNamespace(name="ids", field_type="INTEGER", mode="REPEATED")]
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            variable_sets_from_bq_rows([{"ids": [1]}], schema)
+        self.assertIn("REPEATED", str(ctx.exception))
 
 
 class TestExecuteExt(unittest.TestCase):
@@ -206,6 +271,99 @@ class TestExecuteExt(unittest.TestCase):
                     worker_pool_size=1,
                 )
         self.assertIn("incomplete", str(ctx.exception))
+
+    def test_execute_ext_rejects_both_sources(self):
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            self.connections.execute_ext(
+                "select 1",
+                variable_set_values=[{"store_id": 1}],
+                variable_set_relation="p.d.t",
+            )
+        self.assertIn("only one", str(ctx.exception))
+
+    def test_execute_ext_from_relation(self):
+        mock_response = MagicMock(
+            bytes_processed=1,
+            bytes_billed=1,
+            slot_ms=1,
+            rows_affected=0,
+            job_id="j",
+            location="US",
+            project_id="p",
+            _message="OK",
+        )
+
+        def fake_raw_execute(sql, limit=None, query_parameters=None, on_attempt=None):
+            if on_attempt:
+                on_attempt(1)
+            job = Mock()
+            job.statement_type = "SELECT"
+            job.total_bytes_processed = 1
+            job.total_bytes_billed = 1
+            job.slot_millis = 1
+            job.location = "US"
+            job.project = "p"
+            job.job_id = "j"
+            job.destination = "dest"
+            return job, []
+
+        with patch.object(
+            self.connections,
+            "load_variable_sets_from_relation",
+            return_value=(
+                [{"store_id": 1}, {"store_id": 2}],
+                {"store_id": "INT64"},
+            ),
+        ) as load, patch.object(self.connections, "set_connection_name"), patch.object(
+            self.connections, "get_thread_connection", return_value=MagicMock()
+        ), patch.object(self.connections, "release"), patch.object(
+            self.connections, "raw_execute", side_effect=fake_raw_execute
+        ), patch.object(
+            self.connections,
+            "_response_from_query_job",
+            return_value=(mock_response, MagicMock()),
+        ):
+            response, _ = self.connections.execute_ext(
+                "select @store_id",
+                variable_set_relation="`p`.`d`.`shards`",
+                worker_pool_size=2,
+            )
+
+        load.assert_called_once_with("`p`.`d`.`shards`")
+        self.assertEqual(response.code, "EXECUTE_EXT")
+        self.assertIn("2 parameterized", response._message)
+
+    def test_load_variable_sets_from_relation(self):
+        schema = [
+            SimpleNamespace(name="store_id", field_type="INTEGER", mode="NULLABLE"),
+            SimpleNamespace(name="region", field_type="STRING", mode="NULLABLE"),
+        ]
+
+        class FakeIterator:
+            def __init__(self):
+                self.schema = schema
+                self._rows = [
+                    {"store_id": 1, "region": "us"},
+                    {"store_id": 2, "region": "eu"},
+                ]
+
+            def __iter__(self):
+                return iter(self._rows)
+
+        with patch.object(
+            self.connections,
+            "raw_execute",
+            return_value=(Mock(), FakeIterator()),
+        ) as raw:
+            values, types = self.connections.load_variable_sets_from_relation(
+                "`p`.`d`.`shards`"
+            )
+
+        raw.assert_called_once()
+        self.assertIn("select * from `p`.`d`.`shards`", raw.call_args[0][0])
+        self.assertEqual(len(values), 2)
+        self.assertEqual(types["store_id"], "INT64")
+        self.assertEqual(types["region"], "STRING")
 
 
 if __name__ == "__main__":

@@ -25,8 +25,9 @@ not fanned out across the variable set.
       {%- if ext is not none -%}
         {%- if ext is not mapping -%}
           {% do exceptions.raise_compiler_error(
-            "config execute_ext must be a mapping with variable_set_values, "
-            ~ "optional variable_set_types, and optional worker_pool_size"
+            "config execute_ext must be a mapping with variable_set_values or "
+            ~ "variable_set_relation, optional variable_set_types (values only), "
+            ~ "and optional worker_pool_size"
           ) %}
         {%- endif -%}
         {%- set allowed_materializations = ['incremental_ext', 'script'] -%}
@@ -42,14 +43,19 @@ not fanned out across the variable set.
         {%- if worker_pool_size is none -%}
           {%- set worker_pool_size = 0 -%}
         {%- endif -%}
-        {%- set res, table = adapter.execute_ext(
-            compiled_code,
-            auto_begin=auto_begin,
-            fetch=fetch_result,
-            variable_set_values=ext.get('variable_set_values'),
-            variable_set_types=ext.get('variable_set_types'),
-            worker_pool_size=worker_pool_size,
-        ) -%}
+        {%- set resolved = bq_ext_resolve_variable_sets(ext) -%}
+        {%- if resolved is none -%}
+          {%- set res, table = adapter.execute(compiled_code, auto_begin=auto_begin, fetch=fetch_result) -%}
+        {%- else -%}
+          {%- set res, table = adapter.execute_ext(
+              compiled_code,
+              auto_begin=auto_begin,
+              fetch=fetch_result,
+              variable_set_values=resolved['values'],
+              variable_set_types=resolved['types'],
+              worker_pool_size=worker_pool_size,
+          ) -%}
+        {%- endif -%}
       {%- else -%}
         {%- set res, table = adapter.execute(compiled_code, auto_begin=auto_begin, fetch=fetch_result) -%}
       {%- endif -%}

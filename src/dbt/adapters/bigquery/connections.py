@@ -444,6 +444,53 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
         return response, table
 
+    def load_variable_sets_from_relation(
+        self, relation: Any
+    ) -> Tuple[List[Mapping[str, Any]], Dict[str, str]]:
+        """``SELECT *`` from ``relation`` → (variable_set_values, variable_set_types)."""
+        from dbt.adapters.bigquery.query_parameters import (
+            render_variable_set_relation,
+            variable_sets_from_bq_rows,
+        )
+
+        rendered = render_variable_set_relation(relation)
+        sql = f"select * from {rendered}"
+        logger.debug(f"execute_ext: loading variable sets from relation {rendered}")
+        _, iterator = self.raw_execute(sql, limit=None)
+        rows = list(iterator)
+        schema = getattr(iterator, "schema", None)
+        values, types = variable_sets_from_bq_rows(rows, schema)
+        logger.debug(
+            f"execute_ext: loaded {len(values)} variable set(s) "
+            f"with columns {list(types.keys())} from {rendered}"
+        )
+        return values, types
+
+    def resolve_execute_ext_variable_sets(
+        self,
+        variable_set_values: Optional[Sequence[Mapping[str, Any]]] = None,
+        variable_set_types: Optional[Mapping[str, str]] = None,
+        variable_set_relation: Any = None,
+    ) -> Tuple[Optional[List[Mapping[str, Any]]], Optional[Dict[str, str]]]:
+        """Resolve explicit values or a relation into (values, types).
+
+        Returns ``(None, None)`` when neither source is set (caller should fall
+        back to a single ``execute``).
+        """
+        from dbt.adapters.bigquery.query_parameters import validate_variable_set_source
+
+        validate_variable_set_source(
+            variable_set_values, variable_set_relation, variable_set_types
+        )
+        if variable_set_relation is not None:
+            values, types = self.load_variable_sets_from_relation(variable_set_relation)
+            return list(values), dict(types)
+        if variable_set_values is None:
+            return None, None
+        return validate_variable_set_values(variable_set_values), (
+            dict(variable_set_types) if variable_set_types is not None else None
+        )
+
     def execute_ext(
         self,
         sql,
@@ -453,11 +500,13 @@ class BigQueryConnectionManager(BaseConnectionManager):
         variable_set_values: Optional[Sequence[Mapping[str, Any]]] = None,
         worker_pool_size: int = 0,
         variable_set_types: Optional[Mapping[str, str]] = None,
+        variable_set_relation: Any = None,
     ) -> Tuple[BigQueryAdapterResponse, "agate.Table"]:
         """Execute SQL once, or many times in parallel with query parameters.
 
-        When ``variable_set_values`` is None / omitted, behaves like ``execute``.
-        Otherwise runs ``len(variable_set_values)`` parameterized jobs concurrently.
+        Pass **either** ``variable_set_values`` (+ optional types) **or**
+        ``variable_set_relation`` (types from the relation schema). When neither
+        is set, behaves like ``execute``.
 
         worker_pool_size:
           * 0  — auto parallelism (16 workers)
@@ -470,11 +519,16 @@ class BigQueryConnectionManager(BaseConnectionManager):
         """
         from dbt_common.clients import agate_helper
 
+        variable_sets, variable_set_types = self.resolve_execute_ext_variable_sets(
+            variable_set_values=variable_set_values,
+            variable_set_types=variable_set_types,
+            variable_set_relation=variable_set_relation,
+        )
+
         # Fallback: no parameterized batch → regular execute.
-        if variable_set_values is None:
+        if variable_sets is None:
             return self.execute(sql, auto_begin=auto_begin, fetch=fetch, limit=limit)
 
-        variable_sets = validate_variable_set_values(variable_set_values)
         sql = self._add_query_comment(sql)
 
         if not variable_sets:
