@@ -54,16 +54,17 @@
 {% macro bq_ext_run_serial(sql) %}
   {%- set ext = config.get('execute_ext', none) -%}
   {%- if ext is not none -%}
-    {%- set values = ext.get('variable_set_values') -%}
-    {%- if values is none or values | length == 0 -%}
+    {%- set resolved = bq_ext_resolve_variable_sets(ext) -%}
+    {%- if resolved is none or resolved['values'] is none or resolved['values'] | length == 0 -%}
       {% do exceptions.raise_compiler_error(
-        "execute_ext.variable_set_values must be a non-empty list"
+        "execute_ext requires a non-empty variable_set_values list or "
+        ~ "variable_set_relation with at least one row"
       ) %}
     {%- endif -%}
     {% do adapter.execute_ext(
       sql,
-      variable_set_values=[values[0]],
-      variable_set_types=ext.get('variable_set_types'),
+      variable_set_values=[resolved['values'][0]],
+      variable_set_types=resolved['types'],
       worker_pool_size=1,
     ) %}
   {%- else -%}

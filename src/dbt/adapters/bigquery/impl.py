@@ -1447,6 +1447,29 @@ class BigQueryAdapter(BaseAdapter):
                 f'Got an unexpected location value of "{location}"'
             )
 
+    @available.parse(lambda *a, **k: ({"values": [], "types": {}}))
+    def load_variable_sets_from_relation(self, relation: Any) -> Dict[str, Any]:
+        """Jinja helper: SELECT * from relation → {values, types} for execute_ext."""
+        values, types = self.connections.load_variable_sets_from_relation(relation)
+        return {"values": values, "types": types}
+
+    @available.parse(lambda *a, **k: None)
+    def resolve_execute_ext_variable_sets(
+        self,
+        variable_set_values: Optional[List[Dict[str, Any]]] = None,
+        variable_set_types: Optional[Dict[str, str]] = None,
+        variable_set_relation: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve execute_ext sources to ``{values, types}`` or ``none`` (no batch)."""
+        values, types = self.connections.resolve_execute_ext_variable_sets(
+            variable_set_values=variable_set_values,
+            variable_set_types=variable_set_types,
+            variable_set_relation=variable_set_relation,
+        )
+        if values is None:
+            return None
+        return {"values": values, "types": types}
+
     @available.parse(lambda *a, **k: ({"_message": "OK"}, None))
     def execute_ext(
         self,
@@ -1457,15 +1480,23 @@ class BigQueryAdapter(BaseAdapter):
         variable_set_values: Optional[List[Dict[str, Any]]] = None,
         worker_pool_size: int = 0,
         variable_set_types: Optional[Dict[str, str]] = None,
+        variable_set_relation: Any = None,
     ) -> Tuple[AdapterResponse, Any]:
         """Jinja-callable extended execute with parameterized parallel queries.
 
-        Example::
+        Pass either ``variable_set_values`` (+ optional types) or
+        ``variable_set_relation`` (types from schema)::
 
             {% set res, table = adapter.execute_ext(
                 compiled_code,
                 variable_set_values=[{"store_id": 1}, {"store_id": 2}],
                 variable_set_types={"store_id": "INT64"},
+                worker_pool_size=0,
+            ) %}
+
+            {% set res, table = adapter.execute_ext(
+                compiled_code,
+                variable_set_relation=ref("store_shards"),
                 worker_pool_size=0,
             ) %}
         """
@@ -1477,6 +1508,7 @@ class BigQueryAdapter(BaseAdapter):
             variable_set_values=variable_set_values,
             worker_pool_size=worker_pool_size,
             variable_set_types=variable_set_types,
+            variable_set_relation=variable_set_relation,
         )
 
     # --- Cloud SQL gateway (checkpoints / metadata) ---

@@ -237,3 +237,141 @@ def validate_variable_set_values(variable_set_values: Any) -> List[Mapping[str, 
             )
         values.append(entry)
     return values
+
+
+# BigQuery SchemaField.field_type → ScalarQueryParameter type string
+_BQ_FIELD_TYPE_TO_PARAM: Mapping[str, str] = {
+    "STRING": "STRING",
+    "BYTES": "BYTES",
+    "INTEGER": "INT64",
+    "INT64": "INT64",
+    "FLOAT": "FLOAT64",
+    "FLOAT64": "FLOAT64",
+    "NUMERIC": "NUMERIC",
+    "BIGNUMERIC": "BIGNUMERIC",
+    "BOOLEAN": "BOOL",
+    "BOOL": "BOOL",
+    "DATE": "DATE",
+    "DATETIME": "DATETIME",
+    "TIME": "TIME",
+    "TIMESTAMP": "TIMESTAMP",
+    "GEOGRAPHY": "GEOGRAPHY",
+    "JSON": "JSON",
+    "INTERVAL": "INTERVAL",
+}
+
+
+def bq_field_type_to_param_type(field_type: str) -> str:
+    """Map a BigQuery schema field type to a query-parameter type string."""
+    if field_type is None:
+        raise DbtRuntimeError("Cannot map a null BigQuery field type to a query parameter")
+    normalized = str(field_type).strip().upper()
+    if normalized.startswith(_COMPLEX_TYPE_PREFIXES) or normalized in ("RECORD", "STRUCT"):
+        raise DbtRuntimeError(
+            f"Column type {field_type!r} is not supported for execute_ext variable sets "
+            "(ARRAY/STRUCT/RECORD reserved). Use scalar columns only."
+        )
+    mapped = _BQ_FIELD_TYPE_TO_PARAM.get(normalized)
+    if mapped is None:
+        raise DbtRuntimeError(
+            f"Unsupported BigQuery column type {field_type!r} for execute_ext "
+            "variable_set_relation"
+        )
+    return mapped
+
+
+def validate_variable_set_source(
+    variable_set_values: Any,
+    variable_set_relation: Any,
+    variable_set_types: Any = None,
+) -> None:
+    """Ensure at most one of values / relation is provided; types only with values."""
+    has_values = variable_set_values is not None
+    has_relation = variable_set_relation is not None
+    if has_values and has_relation:
+        raise DbtRuntimeError(
+            "execute_ext: pass only one of variable_set_values or variable_set_relation, "
+            "not both"
+        )
+    if has_relation and variable_set_types is not None:
+        raise DbtRuntimeError(
+            "execute_ext: variable_set_types is not allowed with variable_set_relation "
+            "(parameter types are read from the relation schema)"
+        )
+
+
+def render_variable_set_relation(relation: Any) -> str:
+    """Render a dbt Relation (or string) to a SQL relation literal."""
+    if relation is None:
+        raise DbtRuntimeError("variable_set_relation is null")
+    if isinstance(relation, str):
+        rendered = relation.strip()
+        if not rendered:
+            raise DbtRuntimeError("variable_set_relation must be a non-empty relation")
+        return rendered
+    if hasattr(relation, "render") and callable(relation.render):
+        rendered = str(relation.render()).strip()
+        if not rendered:
+            raise DbtRuntimeError("variable_set_relation.render() returned an empty string")
+        return rendered
+    rendered = str(relation).strip()
+    if not rendered:
+        raise DbtRuntimeError("variable_set_relation must be a non-empty relation")
+    return rendered
+
+
+def variable_sets_from_bq_rows(
+    rows: Sequence[Any],
+    schema: Sequence[Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """Convert BigQuery row results + schema into variable_set_values and types.
+
+    Each row becomes one dict (column name → value). Types come from the schema.
+    NULL cell values raise — BigQuery query parameters cannot be NULL.
+    """
+    if schema is None:
+        raise DbtRuntimeError(
+            "variable_set_relation query returned no schema; cannot build parameter types"
+        )
+
+    types: Dict[str, str] = {}
+    columns: List[str] = []
+    for field in schema:
+        name = getattr(field, "name", None)
+        field_type = getattr(field, "field_type", None)
+        if not name:
+            raise DbtRuntimeError("variable_set_relation schema has a column with no name")
+        mode = getattr(field, "mode", None)
+        if mode and str(mode).upper() == "REPEATED":
+            raise DbtRuntimeError(
+                f"Column {name!r} is REPEATED (ARRAY); ARRAY parameters are not "
+                "supported for execute_ext variable_set_relation"
+            )
+        types[str(name)] = bq_field_type_to_param_type(field_type)
+        columns.append(str(name))
+
+    values: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        entry: Dict[str, Any] = {}
+        for col in columns:
+            try:
+                # Row supports mapping access; fall back to getattr for plain objects.
+                if hasattr(row, "get"):
+                    value = row.get(col)
+                elif isinstance(row, Mapping):
+                    value = row[col]
+                else:
+                    value = row[col]
+            except Exception as exc:  # noqa: BLE001 — normalize access errors
+                raise DbtRuntimeError(
+                    f"variable_set_relation row {i}: failed to read column {col!r}: {exc}"
+                ) from exc
+            if value is None:
+                raise DbtRuntimeError(
+                    f"variable_set_relation row {i}: column {col!r} is NULL. "
+                    "BigQuery parameterized queries do not support NULL parameter values."
+                )
+            entry[col] = value
+        values.append(entry)
+
+    return values, types

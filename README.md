@@ -43,6 +43,40 @@ merge into <target> ... using (select * from _dbt_ext_src) ...
 
 `CREATE TEMP TABLE` lives in that script's job, so concurrent `execute_ext` workers do not see each other's temp tables. Each merge writes only its own rows into the shared target. `unique_key` is optional: with it, matched rows update; without it, the merge is insert-only (append), same as regular `incremental` + `merge`. `incremental_strategy` must be `merge` (the default).
 
+### Variable sets
+
+Pass **exactly one** of:
+
+1. **`variable_set_values`** — explicit list of dicts, optional **`variable_set_types`**
+2. **`variable_set_relation`** — a relation (`ref` / `source` / Relation). dbt runs `SELECT *`, each row becomes one variable set, and parameter types come from the BigQuery schema. Do not pass `variable_set_types` with a relation.
+
+```sql
+-- explicit
+{{ config(
+    materialized="incremental_ext",
+    unique_key="order_id",
+    execute_ext={
+        "variable_set_values": [
+            {"store_id": 1, "region": "us"},
+            {"store_id": 2, "region": "eu"},
+        ],
+        "variable_set_types": {"store_id": "INT64", "region": "STRING"},
+        "worker_pool_size": 0,
+    },
+) }}
+
+-- from a control table (columns = parameter names)
+{{ config(
+    materialized="incremental_ext",
+    execute_ext={
+        "variable_set_relation": ref("store_shards"),
+        "worker_pool_size": 0,
+    },
+) }}
+```
+
+Passing both `variable_set_values` and `variable_set_relation` raises. Rows must not contain NULL in parameter columns (BigQuery query parameters cannot be NULL).
+
 ### Model config
 
 ```sql
@@ -211,8 +245,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post5` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post5` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post6` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post6` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -227,6 +261,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | `1.12.1.post3` | Third DataEng-only release, same upstream base |
 | `1.12.1.post4` | Fourth DataEng-only release, same upstream base |
 | `1.12.1.post5` | Fifth DataEng-only release, same upstream base |
+| `1.12.1.post6` | Sixth DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.
