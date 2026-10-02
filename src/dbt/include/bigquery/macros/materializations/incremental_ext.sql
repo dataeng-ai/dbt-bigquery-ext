@@ -13,7 +13,8 @@
 
   Main statement (this is what execute_ext fans out): one BigQuery script per
   variable set. CREATE TEMP TABLE is job-scoped, so concurrent scripts do not
-  see each other's temp tables, then MERGE into the shared target.
+  see each other's temp tables, then MERGE (or DELETE+MERGE for
+  insert_overwrite) into the shared target.
 #}
 
 {% macro bq_ext_empty_select(compiled_code) %}
@@ -56,8 +57,9 @@
     {%- set resolved = bq_ext_resolve_variable_sets(ext) -%}
     {%- if resolved is none or resolved['values'] is none or resolved['values'] | length == 0 -%}
       {% do exceptions.raise_compiler_error(
-        "execute_ext requires a non-empty variable_set_values list or "
-        ~ "variable_set_relation with at least one row"
+        "execute_ext requires a non-empty variable_set_values list, "
+        ~ "variable_set_relation with at least one row, or variable_set_sql "
+        ~ "returning at least one row"
       ) %}
     {%- endif -%}
     {% do adapter.execute_ext(
@@ -73,11 +75,44 @@
   {%- endif -%}
 {% endmacro %}
 
-{% macro bq_incremental_ext_script(target_relation, compiled_code, unique_key, partition_by, dest_columns, incremental_predicates) %}
+{#
+  Partition-bucket equality for insert_overwrite DELETE / MERGE source filter.
+
+  Mirrors partition_by truncation: DATE/TIMESTAMP/DATETIME_TRUNC at the
+  configured granularity, with @field cast to the partition data_type.
+#}
+{% macro bq_ext_partition_bucket_eq(partition_by, column_expr) %}
+  {%- set param_expr = 'CAST(@' ~ partition_by.field ~ ' AS ' ~ partition_by.data_type|upper ~ ')' -%}
+  {%- if partition_by.data_type_should_be_truncated() -%}
+    {{ partition_by.data_type }}_trunc({{ column_expr }}, {{ partition_by.granularity }})
+      = {{ partition_by.data_type }}_trunc({{ param_expr }}, {{ partition_by.granularity }})
+  {%- else -%}
+    {{ column_expr }} = {{ param_expr }}
+  {%- endif -%}
+{% endmacro %}
+
+{% macro bq_incremental_ext_script(
+    target_relation,
+    compiled_code,
+    unique_key,
+    partition_by,
+    dest_columns,
+    incremental_predicates,
+    strategy='merge'
+) %}
+  {%- if strategy == 'insert_overwrite' -%}
+    {%- set source_sql -%}
+SELECT * FROM _dbt_ext_src
+WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }}
+    {%- endset -%}
+  {%- else -%}
+    {%- set source_sql = 'SELECT * FROM _dbt_ext_src' -%}
+  {%- endif -%}
+
   {%- set merge_sql = bq_generate_incremental_merge_build_sql(
       none,
       target_relation,
-      'SELECT * FROM _dbt_ext_src',
+      source_sql,
       unique_key,
       partition_by,
       dest_columns,
@@ -93,6 +128,10 @@
   CREATE TEMP TABLE _dbt_ext_src AS (
       {{ compiled_code }}
   );
+  {%- if strategy == 'insert_overwrite' %}
+  DELETE FROM {{ target_relation }}
+  WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }};
+  {%- endif %}
   {{ merge_sql }}
 {% endmacro %}
 
@@ -100,9 +139,10 @@
   {%- set unique_key = config.get('unique_key') -%}
 
   {%- set strategy = config.get('incremental_strategy') or 'merge' -%}
-  {%- if strategy != 'merge' -%}
+  {%- if strategy not in ['merge', 'insert_overwrite'] -%}
     {% do exceptions.raise_compiler_error(
-      "incremental_ext only supports incremental_strategy 'merge' (got '" ~ strategy ~ "')"
+      "incremental_ext only supports incremental_strategy 'merge' or "
+      ~ "'insert_overwrite' (got '" ~ strategy ~ "')"
     ) %}
   {%- endif -%}
 
@@ -113,6 +153,58 @@
   {%- set partition_by = adapter.parse_partition_by(raw_partition_by) -%}
   {%- set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') -%}
   {%- set incremental_predicates = config.get('predicates', default=none) or config.get('incremental_predicates', default=none) -%}
+  {%- set ext = config.get('execute_ext', none) -%}
+  {%- set insert_overwrite_values = none -%}
+  {%- set insert_overwrite_types = none -%}
+
+  {%- if strategy == 'insert_overwrite' -%}
+    {%- if unique_key is not none -%}
+      {% do exceptions.raise_compiler_error(
+        "incremental_ext insert_overwrite does not accept unique_key "
+        ~ "(got '" ~ unique_key ~ "')"
+      ) %}
+    {%- endif -%}
+    {%- if partition_by is none -%}
+      {% do exceptions.raise_compiler_error(
+        "incremental_ext insert_overwrite requires partition_by"
+      ) %}
+    {%- endif -%}
+    {%- if partition_by.data_type not in ['date', 'timestamp', 'datetime'] -%}
+      {% do exceptions.raise_compiler_error(
+        "incremental_ext insert_overwrite requires partition_by.data_type of "
+        ~ "date, timestamp, or datetime (got '" ~ partition_by.data_type
+        ~ "'). Integer/range partitioning is not supported."
+      ) %}
+    {%- endif -%}
+    {%- if partition_by.copy_partitions -%}
+      {% do exceptions.raise_compiler_error(
+        "incremental_ext insert_overwrite does not support copy_partitions "
+        ~ "(upstream dbt partition-copy path). It always DELETE+MERGE's the "
+        ~ "matching partition bucket."
+      ) %}
+    {%- endif -%}
+    {%- if ext is none -%}
+      {% do exceptions.raise_compiler_error(
+        "incremental_ext insert_overwrite requires execute_ext with a variable "
+        ~ "set whose sole key is the partition column '" ~ partition_by.field ~ "'"
+      ) %}
+    {%- endif -%}
+    {%- set resolved = bq_ext_resolve_variable_sets(ext) -%}
+    {%- if resolved is none or resolved['values'] is none or resolved['values'] | length == 0 -%}
+      {% do exceptions.raise_compiler_error(
+        "incremental_ext insert_overwrite requires a non-empty variable set "
+        ~ "(variable_set_values, variable_set_relation, or variable_set_sql)"
+      ) %}
+    {%- endif -%}
+    {%- set insert_overwrite_values = adapter.validate_insert_overwrite_variable_sets(
+        resolved['values'],
+        resolved['types'],
+        partition_by.field,
+        partition_by.data_type,
+        partition_by.granularity
+    ) -%}
+    {%- set insert_overwrite_types = resolved['types'] -%}
+  {%- endif -%}
 
   {{ run_hooks(pre_hooks) }}
 
@@ -139,16 +231,41 @@
 
   {%- set dest_columns = adapter.get_columns_in_relation(target_relation) -%}
 
-  {%- call statement('main') -%}
+  {%- set script_sql -%}
     {{ bq_incremental_ext_script(
         target_relation,
         compiled_code,
         unique_key,
         partition_by,
         dest_columns,
-        incremental_predicates
+        incremental_predicates,
+        strategy
     ) }}
-  {%- endcall -%}
+  {%- endset -%}
+
+  {%- if strategy == 'insert_overwrite' -%}
+    {%- if execute -%}
+      {{ log('Writing runtime sql for node "' ~ model['unique_id'] ~ '"') }}
+      {{ write(script_sql) }}
+      {%- set worker_pool_size = ext.get('worker_pool_size', 0) -%}
+      {%- if worker_pool_size is none -%}
+        {%- set worker_pool_size = 0 -%}
+      {%- endif -%}
+      {%- set res, table = adapter.execute_ext(
+          script_sql,
+          auto_begin=true,
+          fetch=false,
+          variable_set_values=insert_overwrite_values,
+          variable_set_types=insert_overwrite_types,
+          worker_pool_size=worker_pool_size,
+      ) -%}
+      {{ store_result('main', response=res, agate_table=table) }}
+    {%- endif -%}
+  {%- else -%}
+    {%- call statement('main') -%}
+      {{ script_sql }}
+    {%- endcall -%}
+  {%- endif -%}
 
   {{ run_hooks(post_hooks) }}
 

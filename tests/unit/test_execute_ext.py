@@ -15,7 +15,9 @@ from dbt.adapters.bigquery.query_parameters import (
     infer_scalar_type,
     render_variable_set_relation,
     resolve_worker_pool_size,
+    validate_insert_overwrite_variable_sets,
     validate_variable_set_source,
+    validate_variable_set_sql,
     validate_variable_set_values,
     variable_sets_from_bq_rows,
 )
@@ -96,15 +98,114 @@ class TestQueryParameters(unittest.TestCase):
     def test_validate_variable_set_source_xor(self):
         validate_variable_set_source([{"a": 1}], None)
         validate_variable_set_source(None, "project.dataset.table")
+        validate_variable_set_source(None, None, variable_set_sql="SELECT 1 AS a")
         validate_variable_set_source(None, None)
         with self.assertRaises(DbtRuntimeError) as ctx:
             validate_variable_set_source([{"a": 1}], "project.dataset.table")
         self.assertIn("only one", str(ctx.exception))
         with self.assertRaises(DbtRuntimeError) as ctx:
             validate_variable_set_source(
+                [{"a": 1}], None, variable_set_sql="SELECT 1 AS a"
+            )
+        self.assertIn("only one", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_variable_set_source(
                 None, "project.dataset.table", variable_set_types={"a": "INT64"}
             )
         self.assertIn("variable_set_types", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_variable_set_source(
+                None, None, variable_set_types={"a": "INT64"}, variable_set_sql="SELECT 1 AS a"
+            )
+        self.assertIn("variable_set_types", str(ctx.exception))
+
+    def test_validate_variable_set_sql(self):
+        self.assertEqual(
+            validate_variable_set_sql("  SELECT 1 AS dt  "), "SELECT 1 AS dt"
+        )
+        with self.assertRaises(DbtRuntimeError):
+            validate_variable_set_sql("   ")
+        with self.assertRaises(DbtRuntimeError):
+            validate_variable_set_sql(None)
+
+    def test_validate_insert_overwrite_variable_sets(self):
+        out = validate_insert_overwrite_variable_sets(
+            [{"dt": "2026-09-23"}, {"dt": datetime.date(2026, 9, 24)}],
+            {"dt": "DATE"},
+            "dt",
+            data_type="date",
+            granularity="day",
+        )
+        self.assertEqual(len(out), 2)
+        # dedupe by day bucket
+        out_deduped = validate_insert_overwrite_variable_sets(
+            [
+                {"dt": "2026-09-23"},
+                {"dt": datetime.date(2026, 9, 23)},
+                {"dt": "2026-09-24"},
+            ],
+            {"dt": "DATE"},
+            "dt",
+        )
+        self.assertEqual(len(out_deduped), 2)
+        self.assertEqual(out_deduped[0]["dt"], "2026-09-23")
+        # month bucket collapses days in same month
+        out_month = validate_insert_overwrite_variable_sets(
+            [{"dt": "2026-09-01"}, {"dt": "2026-09-15"}, {"dt": "2026-10-01"}],
+            {"dt": "DATE"},
+            "dt",
+            data_type="date",
+            granularity="month",
+        )
+        self.assertEqual(len(out_month), 2)
+        validate_insert_overwrite_variable_sets(
+            [{"ts": "2026-09-23T14:00:00"}],
+            {"ts": "TIMESTAMP"},
+            "ts",
+            data_type="timestamp",
+            granularity="hour",
+        )
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_insert_overwrite_variable_sets([], {"dt": "DATE"}, "dt")
+        self.assertIn("non-empty", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_insert_overwrite_variable_sets(
+                [{"dt": "2026-09-23", "extra": 1}], {"dt": "DATE"}, "dt"
+            )
+        self.assertIn("exactly one", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_insert_overwrite_variable_sets(
+                [{"day": "2026-09-23"}], {"day": "DATE"}, "dt"
+            )
+        self.assertIn("partition column", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_insert_overwrite_variable_sets(
+                [{"dt": 1}], {"dt": "INT64"}, "dt"
+            )
+        self.assertIn("DATE, STRING, TIMESTAMP, or DATETIME", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_insert_overwrite_variable_sets(
+                [{"dt": "09/23/2026"}], {"dt": "STRING"}, "dt"
+            )
+        self.assertIn("Partition parameter", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_insert_overwrite_variable_sets(
+                [{"dt": "2026-09-23"}],
+                {"dt": "DATE"},
+                "dt",
+                data_type="int64",
+                granularity="day",
+            )
+        self.assertIn("Integer/range", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            validate_insert_overwrite_variable_sets(
+                [{"ts": "2026-09-23"}],
+                {"ts": "STRING"},
+                "ts",
+                data_type="timestamp",
+                granularity="hour",
+            )
+        self.assertIn("hour", str(ctx.exception))
 
     def test_bq_field_type_to_param_type(self):
         self.assertEqual(bq_field_type_to_param_type("INTEGER"), "INT64")
@@ -280,6 +381,13 @@ class TestExecuteExt(unittest.TestCase):
                 variable_set_relation="p.d.t",
             )
         self.assertIn("only one", str(ctx.exception))
+        with self.assertRaises(DbtRuntimeError) as ctx:
+            self.connections.execute_ext(
+                "select 1",
+                variable_set_values=[{"store_id": 1}],
+                variable_set_sql="SELECT 1 AS store_id",
+            )
+        self.assertIn("only one", str(ctx.exception))
 
     def test_execute_ext_from_relation(self):
         mock_response = MagicMock(
@@ -333,6 +441,58 @@ class TestExecuteExt(unittest.TestCase):
         self.assertEqual(response.code, "EXECUTE_EXT")
         self.assertIn("2 parameterized", response._message)
 
+    def test_execute_ext_from_sql(self):
+        mock_response = MagicMock(
+            bytes_processed=1,
+            bytes_billed=1,
+            slot_ms=1,
+            rows_affected=0,
+            job_id="j",
+            location="US",
+            project_id="p",
+            _message="OK",
+        )
+
+        def fake_raw_execute(sql, limit=None, query_parameters=None, on_attempt=None):
+            if on_attempt:
+                on_attempt(1)
+            job = Mock()
+            job.statement_type = "SELECT"
+            job.total_bytes_processed = 1
+            job.total_bytes_billed = 1
+            job.slot_millis = 1
+            job.location = "US"
+            job.project = "p"
+            job.job_id = "j"
+            job.destination = "dest"
+            return job, []
+
+        with patch.object(
+            self.connections,
+            "load_variable_sets_from_sql",
+            return_value=(
+                [{"dt": datetime.date(2026, 9, 23)}],
+                {"dt": "DATE"},
+            ),
+        ) as load, patch.object(self.connections, "set_connection_name"), patch.object(
+            self.connections, "get_thread_connection", return_value=MagicMock()
+        ), patch.object(self.connections, "release"), patch.object(
+            self.connections, "raw_execute", side_effect=fake_raw_execute
+        ), patch.object(
+            self.connections,
+            "_response_from_query_job",
+            return_value=(mock_response, MagicMock()),
+        ):
+            response, _ = self.connections.execute_ext(
+                "select @dt",
+                variable_set_sql="SELECT CURRENT_DATE() AS dt",
+                worker_pool_size=1,
+            )
+
+        load.assert_called_once_with("SELECT CURRENT_DATE() AS dt")
+        self.assertEqual(response.code, "EXECUTE_EXT")
+        self.assertIn("1 parameterized", response._message)
+
     def test_load_variable_sets_from_relation(self):
         schema = [
             SimpleNamespace(name="store_id", field_type="INTEGER", mode="NULLABLE"),
@@ -364,6 +524,29 @@ class TestExecuteExt(unittest.TestCase):
         self.assertEqual(len(values), 2)
         self.assertEqual(types["store_id"], "INT64")
         self.assertEqual(types["region"], "STRING")
+
+    def test_load_variable_sets_from_sql(self):
+        schema = [SimpleNamespace(name="dt", field_type="DATE", mode="NULLABLE")]
+
+        class FakeIterator:
+            def __init__(self):
+                self.schema = schema
+                self._rows = [{"dt": datetime.date(2026, 9, 23)}]
+
+            def __iter__(self):
+                return iter(self._rows)
+
+        sql = "SELECT dt FROM UNNEST([CURRENT_DATE()]) AS dt"
+        with patch.object(
+            self.connections,
+            "raw_execute",
+            return_value=(Mock(), FakeIterator()),
+        ) as raw:
+            values, types = self.connections.load_variable_sets_from_sql(sql)
+
+        raw.assert_called_once_with(sql, limit=None)
+        self.assertEqual(values, [{"dt": datetime.date(2026, 9, 23)}])
+        self.assertEqual(types, {"dt": "DATE"})
 
 
 if __name__ == "__main__":

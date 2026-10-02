@@ -25,9 +25,9 @@ not fanned out across the variable set.
       {%- if ext is not none -%}
         {%- if ext is not mapping -%}
           {% do exceptions.raise_compiler_error(
-            "config execute_ext must be a mapping with variable_set_values or "
-            ~ "variable_set_relation, optional variable_set_types (values only), "
-            ~ "and optional worker_pool_size"
+            "config execute_ext must be a mapping with variable_set_values, "
+            ~ "variable_set_relation, or variable_set_sql; optional "
+            ~ "variable_set_types (values only); and optional worker_pool_size"
           ) %}
         {%- endif -%}
         {%- set allowed_materializations = ['incremental_ext', 'script'] -%}

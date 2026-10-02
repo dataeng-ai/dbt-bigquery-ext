@@ -1532,22 +1532,52 @@ class BigQueryAdapter(BaseAdapter):
         values, types = self.connections.load_variable_sets_from_relation(relation)
         return {"values": values, "types": types}
 
+    @available.parse(lambda *a, **k: ({"values": [], "types": {}}))
+    def load_variable_sets_from_sql(self, sql: str) -> Dict[str, Any]:
+        """Jinja helper: run SQL → {values, types} for execute_ext."""
+        values, types = self.connections.load_variable_sets_from_sql(sql)
+        return {"values": values, "types": types}
+
     @available.parse(lambda *a, **k: None)
     def resolve_execute_ext_variable_sets(
         self,
         variable_set_values: Optional[List[Dict[str, Any]]] = None,
         variable_set_types: Optional[Dict[str, str]] = None,
         variable_set_relation: Any = None,
+        variable_set_sql: Any = None,
     ) -> Optional[Dict[str, Any]]:
         """Resolve execute_ext sources to ``{values, types}`` or ``none`` (no batch)."""
         values, types = self.connections.resolve_execute_ext_variable_sets(
             variable_set_values=variable_set_values,
             variable_set_types=variable_set_types,
             variable_set_relation=variable_set_relation,
+            variable_set_sql=variable_set_sql,
         )
         if values is None:
             return None
         return {"values": values, "types": types}
+
+    @available.parse(lambda *a, **k: [])
+    def validate_insert_overwrite_variable_sets(
+        self,
+        values: Any,
+        types: Any,
+        partition_field: str,
+        data_type: str = "date",
+        granularity: str = "day",
+    ) -> List[Dict[str, Any]]:
+        """Jinja helper: validate/dedupe insert_overwrite variable sets; return survivors."""
+        from dbt.adapters.bigquery.query_parameters import (
+            validate_insert_overwrite_variable_sets as _validate,
+        )
+
+        return _validate(
+            values,
+            types,
+            partition_field,
+            data_type=data_type,
+            granularity=granularity,
+        )
 
     @available.parse(lambda *a, **k: ({"_message": "OK"}, None))
     def execute_ext(
@@ -1560,11 +1590,12 @@ class BigQueryAdapter(BaseAdapter):
         worker_pool_size: int = 0,
         variable_set_types: Optional[Dict[str, str]] = None,
         variable_set_relation: Any = None,
+        variable_set_sql: Any = None,
     ) -> Tuple[AdapterResponse, Any]:
         """Jinja-callable extended execute with parameterized parallel queries.
 
-        Pass either ``variable_set_values`` (+ optional types) or
-        ``variable_set_relation`` (types from schema)::
+        Pass exactly one of ``variable_set_values`` (+ optional types),
+        ``variable_set_relation``, or ``variable_set_sql`` (types from schema)::
 
             {% set res, table = adapter.execute_ext(
                 compiled_code,
@@ -1578,6 +1609,12 @@ class BigQueryAdapter(BaseAdapter):
                 variable_set_relation=ref("store_shards"),
                 worker_pool_size=0,
             ) %}
+
+            {% set res, table = adapter.execute_ext(
+                compiled_code,
+                variable_set_sql="SELECT dt FROM UNNEST([CURRENT_DATE()]) AS dt",
+                worker_pool_size=0,
+            ) %}
         """
         return self.connections.execute_ext(
             sql=sql,
@@ -1588,6 +1625,7 @@ class BigQueryAdapter(BaseAdapter):
             worker_pool_size=worker_pool_size,
             variable_set_types=variable_set_types,
             variable_set_relation=variable_set_relation,
+            variable_set_sql=variable_set_sql,
         )
 
     # --- Cloud SQL gateway (checkpoints / metadata) ---

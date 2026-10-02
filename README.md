@@ -24,13 +24,17 @@ Without `execute_ext` config, behavior matches upstream `dbt-bigquery`. `increme
 
 ### incremental_ext
 
-Merge-only incremental materialization. It does not `CREATE OR REPLACE` the target and it does not build a shared dataset `__dbt_tmp`.
+Incremental materialization for parameterized fan-out via `execute_ext`. It does not `CREATE OR REPLACE` the target and it does not build a shared dataset `__dbt_tmp`.
 
 Serial, once per run:
 
 1. On `--full-refresh`, `DROP` the existing relation. Truncate would keep the old partition and cluster spec and fail when those change.
 2. `CREATE TABLE IF NOT EXISTS <target> AS SELECT * FROM (<model>) WHERE FALSE` so a missing table is created empty, with the current partition and cluster config.
 3. When `on_schema_change` is not `ignore`, create a dataset temp the same empty way, apply the schema change to the target, then drop the temp.
+
+`incremental_strategy` is `merge` (default) or `insert_overwrite`.
+
+#### merge (default)
 
 The `main` statement is one BigQuery script per variable set:
 
@@ -41,7 +45,59 @@ CREATE TEMP TABLE _dbt_ext_src AS (
 MERGE INTO <target> ... USING (SELECT * FROM _dbt_ext_src) ...
 ```
 
-`CREATE TEMP TABLE` lives in that script's job, so concurrent `execute_ext` workers do not see each other's temp tables. Each merge writes only its own rows into the shared target. `unique_key` is optional: with it, matched rows update; without it, the merge is insert-only (append), same as regular `incremental` + `merge`. `incremental_strategy` must be `merge` (the default).
+`CREATE TEMP TABLE` lives in that script's job, so concurrent `execute_ext` workers do not see each other's temp tables. Each merge writes only its own rows into the shared target. `unique_key` is optional: with it, matched rows update; without it, the merge is insert-only (append), same as regular `incremental` + `merge`.
+
+#### insert_overwrite
+
+Same `CREATE TEMP TABLE` as merge (model SQL unchanged). Then delete the matching
+partition bucket and merge only rows from that bucket:
+
+```sql
+CREATE TEMP TABLE _dbt_ext_src AS (
+  <model sql, with @dt>
+);
+DELETE FROM <target>
+WHERE date_trunc(dt, day) = date_trunc(CAST(@dt AS DATE), day);  -- shape depends on data_type/granularity
+MERGE INTO <target> ...
+USING (
+  SELECT * FROM _dbt_ext_src
+  WHERE date_trunc(dt, day) = date_trunc(CAST(@dt AS DATE), day)
+) ...
+```
+
+(Exact predicate uses `{data_type}_trunc` when needed — e.g. `timestamp_trunc(ts, hour)` — or plain `col = CAST(@col AS …)` for `date` + `day`.)
+
+This keeps temp creation identical to merge and applies the partition guard on the MERGE source (same place merge already reads `SELECT * FROM _dbt_ext_src`).
+
+Requirements:
+
+- Time partitioning only: `partition_by.data_type` in `date` / `timestamp` / `datetime`
+- Granularity `hour` / `day` / `month` / `year` (`hour` requires timestamp/datetime)
+- `execute_ext` required; each variable set has **exactly one** key = `partition_by.field`
+- Parameter type `DATE` / `STRING` / `TIMESTAMP` / `DATETIME`; values coerce to the partition type. For `hour`, pass a timestamp/datetime (not date-only)
+- Variable sets are **deduped by partition bucket** (first wins) so duplicate days/hours do not race
+- `unique_key` is not allowed
+- `copy_partitions` is not supported (see below)
+
+`copy_partitions` (upstream dbt-bigquery): when true, regular `incremental` + `insert_overwrite` can replace partitions by copying whole partition shards (`table$YYYYMMDD`) via the BigQuery Jobs API instead of row SQL. **`incremental_ext` does not implement that path** — it always runs `DELETE` of the matching bucket then insert-only `MERGE`. Passing `copy_partitions: true` raises.
+
+```sql
+{{ config(
+    materialized="incremental_ext",
+    incremental_strategy="insert_overwrite",
+    partition_by={"field": "dt", "data_type": "date", "granularity": "day"},
+    execute_ext={
+        "variable_set_sql": "SELECT dt FROM UNNEST([CURRENT_DATE() - 1, CURRENT_DATE()]) AS dt",
+        "worker_pool_size": 0,
+    },
+) }}
+
+select *
+from {{ source("raw", "events") }}
+where dt = @dt
+```
+
+You can still filter in the model SQL; the MERGE source predicate is a safety net so extra partitions in the temp table are not inserted.
 
 ## Relation markers (`ref` / `source`)
 
@@ -60,6 +116,7 @@ Pass **exactly one** of:
 
 1. **`variable_set_values`** — explicit list of dicts, optional **`variable_set_types`**
 2. **`variable_set_relation`** — a relation (`ref` / `source` / Relation). dbt runs `SELECT *`, each row becomes one variable set, and parameter types come from the BigQuery schema. Do not pass `variable_set_types` with a relation.
+3. **`variable_set_sql`** — a SQL string that returns one row per variable set (column names = parameter names). Types come from the result schema. Do not pass `variable_set_types` with SQL. Prefer a **simple** query (e.g. `UNNEST` of a few dates). The SQL may run more than once per dbt invocation (serial DDL + resolve); for expensive logic, put results in a table and use `variable_set_relation` instead.
 
 ```sql
 -- explicit
@@ -84,9 +141,20 @@ Pass **exactly one** of:
         "worker_pool_size": 0,
     },
 ) }}
+
+-- from ad-hoc SQL (e.g. always reprocess yesterday + today)
+{{ config(
+    materialized="incremental_ext",
+    incremental_strategy="insert_overwrite",
+    partition_by={"field": "dt", "data_type": "date"},
+    execute_ext={
+        "variable_set_sql": "SELECT dt FROM UNNEST([CURRENT_DATE() - 1, CURRENT_DATE()]) AS dt",
+        "worker_pool_size": 0,
+    },
+) }}
 ```
 
-Passing both `variable_set_values` and `variable_set_relation` raises. Rows must not contain NULL in parameter columns (BigQuery query parameters cannot be NULL).
+Passing more than one of `variable_set_values` / `variable_set_relation` / `variable_set_sql` raises. Rows must not contain NULL in parameter columns (BigQuery query parameters cannot be NULL).
 
 ### Model config
 
@@ -256,8 +324,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post9` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post9` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post10` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post10` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -276,6 +344,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | `1.12.1.post7` | Seventh DataEng-only release, same upstream base |
 | `1.12.1.post8` | Eighth DataEng-only release, same upstream base |
 | `1.12.1.post9` | Ninth DataEng-only release, same upstream base |
+| `1.12.1.post10` | Tenth DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.
