@@ -386,12 +386,14 @@ def validate_insert_overwrite_variable_sets(
     Args:
         values: Resolved variable_set_values (list of dicts).
         types: Optional type map (from schema or variable_set_types).
-        partition_field: Target partition column name; must be the sole parameter.
+        partition_field: Target partition column name (used for docs/errors only;
+            the sole variable-set key may differ, e.g. ``dt`` vs ``__taken_at_utc``).
         data_type: ``partition_by.data_type`` (``date`` / ``timestamp`` / ``datetime``).
         granularity: ``partition_by.granularity`` (``hour`` / ``day`` / ``month`` / ``year``).
 
     Returns:
-        Deduped variable sets (first wins per partition bucket).
+        Deduped variable sets (first wins per partition bucket). Each set has
+        exactly one key; all sets share that same key name.
 
     Raises:
         DbtRuntimeError: On empty sets, wrong keys/types/values, or unsupported partition.
@@ -434,6 +436,7 @@ def validate_insert_overwrite_variable_sets(
     }
     deduped: List[Dict[str, Any]] = []
     seen_buckets: set[str] = set()
+    param_name: Optional[str] = None
     for i, entry in enumerate(values):
         set_label = "set[{}]".format(i)
         if not isinstance(entry, Mapping):
@@ -445,25 +448,30 @@ def validate_insert_overwrite_variable_sets(
             keys = sorted(str(k) for k in entry.keys())
             raise DbtRuntimeError(
                 "incremental_ext insert_overwrite variable {} must have exactly "
-                "one key equal to the partition column {!r}; got keys {}".format(
-                    set_label, field, keys
+                "one key (partition parameter); got keys {}. "
+                "partition_by.field is {!r} (name need not match).".format(
+                    set_label, keys, field
                 )
             )
-        name = next(iter(entry.keys()))
-        if str(name) != field:
+        name = str(next(iter(entry.keys())))
+        if param_name is None:
+            param_name = name
+        elif name != param_name:
             raise DbtRuntimeError(
-                "incremental_ext insert_overwrite variable {} key must be the "
-                "partition column {!r}; got {!r}".format(set_label, field, name)
+                "incremental_ext insert_overwrite variable {} key must be {!r} "
+                "(same sole parameter as earlier sets); got {!r}".format(
+                    set_label, param_name, name
+                )
             )
         value = entry[name]
-        declared = type_map.get(str(name))
+        declared = type_map.get(name)
         if declared is None:
-            declared = infer_scalar_type(str(name), value)
+            declared = infer_scalar_type(name, value)
         if declared not in _INSERT_OVERWRITE_PARAM_TYPES:
             raise DbtRuntimeError(
                 "incremental_ext insert_overwrite parameter {!r} must be DATE, "
                 "STRING, TIMESTAMP, or DATETIME; got type {!r} for {}".format(
-                    field, declared, set_label
+                    name, declared, set_label
                 )
             )
         try:
@@ -471,7 +479,7 @@ def validate_insert_overwrite_variable_sets(
         except DbtRuntimeError as exc:
             raise DbtRuntimeError(
                 "incremental_ext insert_overwrite parameter {!r} {}: {}".format(
-                    field, set_label, exc
+                    name, set_label, exc
                 )
             ) from exc
         if gran == "hour" and isinstance(value, datetime.date) and not isinstance(
@@ -480,13 +488,13 @@ def validate_insert_overwrite_variable_sets(
             raise DbtRuntimeError(
                 "incremental_ext insert_overwrite parameter {!r} {} with "
                 "granularity 'hour' requires a timestamp/datetime (or ISO datetime "
-                "string), not a date-only value; got {!r}".format(field, set_label, value)
+                "string), not a date-only value; got {!r}".format(name, set_label, value)
             )
         if gran == "hour" and isinstance(value, str) and _ISO_DATE_RE.match(value.strip()):
             raise DbtRuntimeError(
                 "incremental_ext insert_overwrite parameter {!r} {} with "
                 "granularity 'hour' requires a timestamp/datetime string, not "
-                "YYYY-MM-DD only; got {!r}".format(field, set_label, value)
+                "YYYY-MM-DD only; got {!r}".format(name, set_label, value)
             )
         _ = parsed
         bucket = _partition_bucket_key(value, dtype, gran)

@@ -173,11 +173,25 @@ class TestQueryParameters(unittest.TestCase):
                 [{"dt": "2026-09-23", "extra": 1}], {"dt": "DATE"}, "dt"
             )
         self.assertIn("exactly one", str(ctx.exception))
+        # param name may differ from partition_by.field
+        mismatched = validate_insert_overwrite_variable_sets(
+            [{"dt": "2026-09-01"}, {"dt": "2026-09-03"}],
+            {"dt": "DATE"},
+            "__taken_at_utc",
+            data_type="datetime",
+            granularity="day",
+        )
+        self.assertEqual(len(mismatched), 2)
+        self.assertEqual(list(mismatched[0].keys()), ["dt"])
         with self.assertRaises(DbtRuntimeError) as ctx:
             validate_insert_overwrite_variable_sets(
-                [{"day": "2026-09-23"}], {"day": "DATE"}, "dt"
+                [{"dt": "2026-09-01"}, {"other": "2026-09-03"}],
+                {"dt": "DATE"},
+                "__taken_at_utc",
+                data_type="datetime",
+                granularity="day",
             )
-        self.assertIn("partition column", str(ctx.exception))
+        self.assertIn("same sole parameter", str(ctx.exception))
         with self.assertRaises(DbtRuntimeError) as ctx:
             validate_insert_overwrite_variable_sets(
                 [{"dt": 1}], {"dt": "INT64"}, "dt"

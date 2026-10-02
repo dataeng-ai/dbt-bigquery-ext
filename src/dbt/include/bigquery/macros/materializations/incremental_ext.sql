@@ -78,11 +78,12 @@
 {#
   Partition-bucket equality for insert_overwrite DELETE / MERGE source filter.
 
-  Mirrors partition_by truncation: DATE/TIMESTAMP/DATETIME_TRUNC at the
-  configured granularity, with @field cast to the partition data_type.
+  Column side uses partition_by.field; parameter side uses param_name (the sole
+  execute_ext variable key), cast to the partition data_type. Names may differ
+  (e.g. column __taken_at_utc, parameter @dt).
 #}
-{% macro bq_ext_partition_bucket_eq(partition_by, column_expr) %}
-  {%- set param_expr = 'CAST(@' ~ partition_by.field ~ ' AS ' ~ partition_by.data_type|upper ~ ')' -%}
+{% macro bq_ext_partition_bucket_eq(partition_by, column_expr, param_name) %}
+  {%- set param_expr = 'CAST(@' ~ param_name ~ ' AS ' ~ partition_by.data_type|upper ~ ')' -%}
   {%- if partition_by.data_type_should_be_truncated() -%}
     {{ partition_by.data_type }}_trunc({{ column_expr }}, {{ partition_by.granularity }})
       = {{ partition_by.data_type }}_trunc({{ param_expr }}, {{ partition_by.granularity }})
@@ -98,12 +99,14 @@
     partition_by,
     dest_columns,
     incremental_predicates,
-    strategy='merge'
+    strategy='merge',
+    partition_param_name=none
 ) %}
   {%- if strategy == 'insert_overwrite' -%}
+    {%- set param_name = partition_param_name if partition_param_name is not none else partition_by.field -%}
     {%- set source_sql -%}
 SELECT * FROM _dbt_ext_src
-WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }}
+WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name) }}
     {%- endset -%}
   {%- else -%}
     {%- set source_sql = 'SELECT * FROM _dbt_ext_src' -%}
@@ -130,7 +133,7 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }}
   );
   {%- if strategy == 'insert_overwrite' %}
   DELETE FROM {{ target_relation }}
-  WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }};
+  WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name) }};
   {%- endif %}
   {{ merge_sql }}
 {% endmacro %}
@@ -156,6 +159,7 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }}
   {%- set ext = config.get('execute_ext', none) -%}
   {%- set insert_overwrite_values = none -%}
   {%- set insert_overwrite_types = none -%}
+  {%- set partition_param_name = none -%}
 
   {%- if strategy == 'insert_overwrite' -%}
     {%- if unique_key is not none -%}
@@ -186,7 +190,8 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }}
     {%- if ext is none -%}
       {% do exceptions.raise_compiler_error(
         "incremental_ext insert_overwrite requires execute_ext with a variable "
-        ~ "set whose sole key is the partition column '" ~ partition_by.field ~ "'"
+        ~ "set that has exactly one parameter (name may differ from "
+        ~ "partition_by.field '" ~ partition_by.field ~ "')"
       ) %}
     {%- endif -%}
     {%- set resolved = bq_ext_resolve_variable_sets(ext) -%}
@@ -204,6 +209,7 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }}
         partition_by.granularity
     ) -%}
     {%- set insert_overwrite_types = resolved['types'] -%}
+    {%- set partition_param_name = insert_overwrite_values[0].keys() | list | first -%}
   {%- endif -%}
 
   {{ run_hooks(pre_hooks) }}
@@ -239,7 +245,8 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field) }}
         partition_by,
         dest_columns,
         incremental_predicates,
-        strategy
+        strategy,
+        partition_param_name
     ) }}
   {%- endset -%}
 

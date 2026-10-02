@@ -73,7 +73,7 @@ Requirements:
 
 - Time partitioning only: `partition_by.data_type` in `date` / `timestamp` / `datetime`
 - Granularity `hour` / `day` / `month` / `year` (`hour` requires timestamp/datetime)
-- `execute_ext` required; each variable set has **exactly one** key = `partition_by.field`
+- `execute_ext` required; each variable set has **exactly one** parameter (name may differ from `partition_by.field`, e.g. `@dt` vs column `__taken_at_utc`)
 - Parameter type `DATE` / `STRING` / `TIMESTAMP` / `DATETIME`; values coerce to the partition type. For `hour`, pass a timestamp/datetime (not date-only)
 - Variable sets are **deduped by partition bucket** (first wins) so duplicate days/hours do not race
 - `unique_key` is not allowed
@@ -85,19 +85,19 @@ Requirements:
 {{ config(
     materialized="incremental_ext",
     incremental_strategy="insert_overwrite",
-    partition_by={"field": "dt", "data_type": "date", "granularity": "day"},
+    partition_by={"field": "__taken_at_utc", "data_type": "datetime", "granularity": "day"},
     execute_ext={
-        "variable_set_sql": "SELECT dt FROM UNNEST([CURRENT_DATE() - 1, CURRENT_DATE()]) AS dt",
+        "variable_set_sql": "SELECT dt FROM UNNEST([DATE '2026-09-01', DATE '2026-09-03']) AS dt",
         "worker_pool_size": 0,
     },
 ) }}
 
-select *
-from {{ source("raw", "events") }}
-where dt = @dt
+select
+  @dt as dt,
+  cast(@dt as timestamp) as __taken_at_utc
 ```
 
-You can still filter in the model SQL; the MERGE source predicate is a safety net so extra partitions in the temp table are not inserted.
+DELETE/MERGE compare `partition_by.field` to `CAST(@<sole_param> AS <data_type>)` (with trunc when needed), so the parameter name need not match the column.
 
 ## Relation markers (`ref` / `source`)
 
@@ -324,8 +324,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post10` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post10` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post11` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post11` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -345,6 +345,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | `1.12.1.post8` | Eighth DataEng-only release, same upstream base |
 | `1.12.1.post9` | Ninth DataEng-only release, same upstream base |
 | `1.12.1.post10` | Tenth DataEng-only release, same upstream base |
+| `1.12.1.post11` | Eleventh DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.
