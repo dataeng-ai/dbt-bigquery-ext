@@ -79,16 +79,19 @@
   Partition-bucket equality for insert_overwrite DELETE / MERGE source filter.
 
   Column side uses partition_by.field; parameter side uses param_name (the sole
-  execute_ext variable key), cast to the partition data_type. Names may differ
-  (e.g. column __taken_at_utc, parameter @dt).
+  execute_ext variable key). Both sides are CAST to partition_by.data_type so a
+  TIMESTAMP column still compares cleanly when data_type is datetime (and vice
+  versa). Names may differ (e.g. column __taken_at_utc, parameter @dt).
 #}
 {% macro bq_ext_partition_bucket_eq(partition_by, column_expr, param_name) %}
-  {%- set param_expr = 'CAST(@' ~ param_name ~ ' AS ' ~ partition_by.data_type|upper ~ ')' -%}
+  {%- set dtype = partition_by.data_type | upper -%}
+  {%- set gran = partition_by.granularity | upper -%}
+  {%- set col_expr = 'CAST(' ~ column_expr ~ ' AS ' ~ dtype ~ ')' -%}
+  {%- set param_expr = 'CAST(@' ~ param_name ~ ' AS ' ~ dtype ~ ')' -%}
   {%- if partition_by.data_type_should_be_truncated() -%}
-    {{ partition_by.data_type }}_trunc({{ column_expr }}, {{ partition_by.granularity }})
-      = {{ partition_by.data_type }}_trunc({{ param_expr }}, {{ partition_by.granularity }})
+    {{ dtype }}_TRUNC({{ col_expr }}, {{ gran }}) = {{ dtype }}_TRUNC({{ param_expr }}, {{ gran }})
   {%- else -%}
-    {{ column_expr }} = {{ param_expr }}
+    {{ col_expr }} = {{ param_expr }}
   {%- endif -%}
 {% endmacro %}
 

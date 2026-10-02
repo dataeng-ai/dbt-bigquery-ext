@@ -57,15 +57,15 @@ CREATE TEMP TABLE _dbt_ext_src AS (
   <model sql, with @dt>
 );
 DELETE FROM <target>
-WHERE date_trunc(dt, day) = date_trunc(CAST(@dt AS DATE), day);  -- shape depends on data_type/granularity
+WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY);  -- shape depends on data_type/granularity
 MERGE INTO <target> ...
 USING (
   SELECT * FROM _dbt_ext_src
-  WHERE date_trunc(dt, day) = date_trunc(CAST(@dt AS DATE), day)
+  WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY)
 ) ...
 ```
 
-(Exact predicate uses `{data_type}_trunc` when needed — e.g. `timestamp_trunc(ts, hour)` — or plain `col = CAST(@col AS …)` for `date` + `day`.)
+(Exact predicate uses `{DATA_TYPE}_TRUNC(CAST(col AS …), GRAN)` when needed — e.g. `TIMESTAMP_TRUNC(..., HOUR)` — or `CAST(col AS DATE) = CAST(@param AS DATE)` for `date` + `day`. Both sides are cast so column storage type need not match `partition_by.data_type` exactly.)
 
 This keeps temp creation identical to merge and applies the partition guard on the MERGE source (same place merge already reads `SELECT * FROM _dbt_ext_src`).
 
@@ -97,7 +97,7 @@ select
   cast(@dt as timestamp) as __taken_at_utc
 ```
 
-DELETE/MERGE compare `partition_by.field` to `CAST(@<sole_param> AS <data_type>)` (with trunc when needed), so the parameter name need not match the column.
+DELETE/MERGE compare `CAST(<partition_by.field> AS <data_type>)` to `CAST(@<sole_param> AS <data_type>)` (with `_TRUNC` when needed), so the parameter name and physical column type need not match `partition_by` exactly.
 
 ## Relation markers (`ref` / `source`)
 
@@ -324,8 +324,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post11` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post11` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post12` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post12` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -346,6 +346,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | `1.12.1.post9` | Ninth DataEng-only release, same upstream base |
 | `1.12.1.post10` | Tenth DataEng-only release, same upstream base |
 | `1.12.1.post11` | Eleventh DataEng-only release, same upstream base |
+| `1.12.1.post12` | Twelfth DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.
