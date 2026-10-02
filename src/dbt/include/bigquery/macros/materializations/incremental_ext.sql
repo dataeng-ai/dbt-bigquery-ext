@@ -17,10 +17,11 @@
 #}
 
 {% macro bq_ext_empty_select(compiled_code) %}
-  select * from (
-    {{ compiled_code }}
+  SELECT *
+  FROM (
+      {{ compiled_code }}
   )
-  where false
+  WHERE FALSE
 {% endmacro %}
 
 {% macro bq_ext_create_table_if_not_exists(relation, compiled_code) %}
@@ -33,24 +34,22 @@
     ) %}
   {%- endif -%}
 
-  create table if not exists {{ relation }}
-    {{ partition_by(partition_config) }}
-    {{ cluster_by(raw_cluster_by) }}
-    {{ bigquery_table_options(config, model, false) }}
-  as (
-    {{ bq_ext_empty_select(compiled_code) }}
+  CREATE TABLE IF NOT EXISTS {{ relation }}
+      {{ partition_by(partition_config) }}
+      {{ cluster_by(raw_cluster_by) }}
+  {{ bigquery_table_options(config, model, false) }}
+  AS (
+      {{ bq_ext_empty_select(compiled_code) }}
   )
 {% endmacro %}
 
 {% macro bq_ext_create_schema_probe(relation, compiled_code) %}
-  create or replace table {{ relation }}
-  as (
-    {{ bq_ext_empty_select(compiled_code) }}
+  CREATE OR REPLACE TABLE {{ relation }}
+  AS (
+      {{ bq_ext_empty_select(compiled_code) }}
   )
 {% endmacro %}
 
-{# Run SQL once. When execute_ext is set, bind only the first variable set so
-   @parameters in the model SQL are valid. This must not be statement('main'). #}
 {% macro bq_ext_run_serial(sql) %}
   {%- set ext = config.get('execute_ext', none) -%}
   {%- if ext is not none -%}
@@ -78,7 +77,7 @@
   {%- set merge_sql = bq_generate_incremental_merge_build_sql(
       none,
       target_relation,
-      'select * from _dbt_ext_src',
+      'SELECT * FROM _dbt_ext_src',
       unique_key,
       partition_by,
       dest_columns,
@@ -91,15 +90,13 @@
   {%- endif -%}
 
   {{ sql_header if sql_header is not none }}
-  create temp table _dbt_ext_src as (
-    {{ compiled_code }}
+  CREATE TEMP TABLE _dbt_ext_src AS (
+      {{ compiled_code }}
   );
   {{ merge_sql }}
 {% endmacro %}
 
 {% materialization incremental_ext, adapter='bigquery', supported_languages=['sql'] -%}
-
-  {# unique_key optional: omitted => insert-only MERGE (append), same as incremental. #}
   {%- set unique_key = config.get('unique_key') -%}
 
   {%- set strategy = config.get('incremental_strategy') or 'merge' -%}
@@ -116,7 +113,6 @@
   {%- set partition_by = adapter.parse_partition_by(raw_partition_by) -%}
   {%- set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') -%}
   {%- set incremental_predicates = config.get('predicates', default=none) or config.get('incremental_predicates', default=none) -%}
-  {%- set grant_config = config.get('grants') -%}
 
   {{ run_hooks(pre_hooks) }}
 
@@ -156,8 +152,6 @@
 
   {{ run_hooks(post_hooks) }}
 
-  {% set should_revoke = should_revoke(existing_relation, full_refresh_mode) %}
-  {% do apply_grants(target_relation, grant_config, should_revoke) %}
   {% do persist_docs(target_relation, model) %}
 
   {{ return({'relations': [target_relation]}) }}

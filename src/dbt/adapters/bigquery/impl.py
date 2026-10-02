@@ -2,6 +2,7 @@ import copy
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing.context import SpawnContext
+import re
 import threading
 from typing import (
     Any,
@@ -243,6 +244,79 @@ class BigQueryAdapter(BaseAdapter):
         self._gateway = None
         self._gateway_ensured = False
         self._gateway_lock = threading.RLock()
+
+    @staticmethod
+    def make_relation_marker_id(kind: str, parts: Any, *extra: Any) -> str:
+        """Build a stable marker token for Relation.render() comments.
+
+        Args:
+            kind: Marker kind prefix segment (e.g. ``ref`` or ``source``).
+            parts: Name part, or a list/tuple of parts (Jinja often passes a list).
+            *extra: Additional name parts after ``parts``.
+
+        Returns:
+            Token such as ``dlt-ref-dim_products`` (non-alphanumeric chars replaced).
+
+        Raises:
+            DbtRuntimeError: If no usable name parts are provided.
+        """
+        collected: List[Any] = []
+        if isinstance(parts, (list, tuple)):
+            collected.extend(parts)
+        elif parts is not None and parts != "":
+            collected.append(parts)
+        collected.extend(extra)
+
+        cleaned: List[str] = []
+        for part in collected:
+            if part is None or part == "":
+                continue
+            cleaned.append(re.sub(r"[^A-Za-z0-9_]+", "_", str(part)).strip("_"))
+        if not cleaned:
+            raise dbt_common.exceptions.DbtRuntimeError(
+                f"make_relation_marker_id requires at least one part (kind={kind!r})"
+            )
+        return f"dlt-{kind}-{'-'.join(cleaned)}"
+
+    def mark_relation(self, relation: BigQueryRelation, marker: str) -> BigQueryRelation:
+        """Attach a relation_marker so Relation.render() wraps the FQN.
+
+        Args:
+            relation: Relation to mark.
+            marker: Marker id (e.g. ``dlt-ref-dim_products``).
+
+        Returns:
+            Relation with ``relation_marker`` set, or the input when ``marker`` is
+            empty or the relation is an ephemeral CTE.
+        """
+        if not marker:
+            return relation
+        if getattr(relation, "is_cte", False):
+            return relation
+        return relation.incorporate(relation_marker=marker)
+
+    def should_mark_relations(self, config: Any = None) -> bool:
+        """Return whether ref/source should attach relation_marker on render.
+
+        Args:
+            config: Model config object with a ``get`` method (dbt config), or None.
+
+        Returns:
+            True when ``mark_relations`` is true, or when ``materialized`` is
+            ``incremental_ext`` or ``script``. Explicit ``mark_relations=false``
+            disables marking even on those materializations. False when config is
+            None.
+        """
+        if config is None:
+            return False
+        get = config.get if hasattr(config, "get") else lambda *a, **k: None
+        explicit = get("mark_relations")
+        if explicit is True:
+            return True
+        if explicit is False:
+            return False
+        materialized = get("materialized")
+        return materialized in ("incremental_ext", "script")
 
     def acquire_connection(self, name=None):
         connection = super().acquire_connection(name)

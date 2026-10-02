@@ -25,11 +25,11 @@
     {%- set source_sql -%}
         {%- if tmp_relation_exists -%}
         (
-        select
+        SELECT
         {% if partition_by.time_ingestion_partitioning -%}
         {{ partition_by.insertable_time_partitioning_field() }},
         {%- endif -%}
-        * from {{ tmp_relation }}
+        * FROM {{ tmp_relation }}
         )
         {%- else -%} {#-- wrap sql in parens to make it a subquery --#}
         (

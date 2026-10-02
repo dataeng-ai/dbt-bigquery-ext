@@ -31,6 +31,7 @@ class BigQueryRelation(BaseRelation):
     quote_character: str = "`"
     location: Optional[str] = None
     require_alias: bool = False
+    relation_marker: Optional[str] = None
 
     renameable_relations: FrozenSet[RelationType] = field(
         default_factory=lambda: frozenset(
@@ -48,6 +49,22 @@ class BigQueryRelation(BaseRelation):
             }
         )
     )
+
+    def render(self) -> str:
+        """Render the relation FQN, optionally wrapped in relation_marker comments.
+
+        When ``relation_marker`` is set, the FQN is wrapped with the same open and
+        close token (e.g. ``/* <dlt-ref-x> */`p`.`s`.`t`/* <dlt-ref-x> */``) so
+        callers can locate and substitute the occurrence later.
+
+        Returns:
+            Fully qualified name string, with markers when ``relation_marker`` is set.
+        """
+        rendered = super().render()
+        if not self.relation_marker:
+            return rendered
+        token = f"/* <{self.relation_marker}> */"
+        return f"{token}{rendered}{token}"
 
     def matches(
         self,

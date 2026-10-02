@@ -120,20 +120,43 @@ class CloudSqlGateway:
                 pass
 
     def _table_exists(self, conn, table: str) -> bool:
+        """Return True if the table is visible via SELECT (not only information_schema)."""
         cur = conn.cursor()
         try:
             cur.execute(
-                gateway_schema.TABLE_EXISTS_SQL,
-                (self._config.schema_name, table),
+                f"SELECT 1 FROM {self._config.schema_name}.{table} LIMIT 0"
             )
-            return cur.fetchone() is not None
+            return True
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "does not exist" in msg or "undefinedtable" in msg.replace(" ", ""):
+                return False
+            if "permission denied" in msg or "42501" in str(exc):
+                raise DbtRuntimeError(
+                    f"gateway: IAM user {self._iam_user!r} cannot access "
+                    f"{self._config.schema_name}.{table} ({exc}). "
+                    f'Grant SELECT, INSERT (and USAGE on schema {self._config.schema_name}) '
+                    f"to that role."
+                ) from exc
+            try:
+                cur.execute(
+                    gateway_schema.TABLE_EXISTS_SQL,
+                    (self._config.schema_name, table),
+                )
+                return cur.fetchone() is not None
+            except Exception:
+                raise
         finally:
             cur.close()
 
     def ensure_schema(self) -> Dict[str, str]:
-        """Connect and create missing metadata tables. Skip objects that already exist.
+        """Connect and create missing metadata tables; skip objects that already exist.
 
-        Returns a map of table name -> 'exists' | 'created'.
+        When a table already exists (e.g. a shared metadata database), DDL is skipped so
+        IAM users without CREATE on the schema are not blocked.
+
+        Returns:
+            Map of table name to ``'exists'`` or ``'created'``.
         """
         with self._lock:
             status: Dict[str, str] = {}
@@ -144,20 +167,28 @@ class CloudSqlGateway:
                         if self._table_exists(conn, table):
                             status[table] = "exists"
                             logger.debug(
-                                f"gateway: table {self._config.schema_name}.{table} already exists"
+                                f"gateway: table {self._config.schema_name}.{table} already exists; skip DDL"
                             )
-                            # Still apply non-table DDL (indexes) idempotently.
-                            for template in ddl_templates[1:]:
+                            continue
+                        try:
+                            for template in ddl_templates:
                                 sql = gateway_schema.format_ddl(
                                     template, self._config.schema_name, table
                                 )
                                 cur.execute(sql)
-                            continue
-                        for template in ddl_templates:
-                            sql = gateway_schema.format_ddl(
-                                template, self._config.schema_name, table
-                            )
-                            cur.execute(sql)
+                        except Exception as exc:
+                            if self._table_exists(conn, table):
+                                status[table] = "exists"
+                                logger.warning(
+                                    f"gateway: create {self._config.schema_name}.{table} "
+                                    f"failed but table exists; continuing ({exc})"
+                                )
+                                continue
+                            raise DbtRuntimeError(
+                                f"gateway: cannot create {self._config.schema_name}.{table} "
+                                f"({exc}). Grant CREATE on schema {self._config.schema_name} "
+                                f"to IAM user {self._iam_user!r}, or create the table as an admin."
+                            ) from exc
                         status[table] = "created"
                         logger.info(
                             f"gateway: created table {self._config.schema_name}.{table}"

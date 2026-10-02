@@ -35,13 +35,24 @@ Serial, once per run:
 The `main` statement is one BigQuery script per variable set:
 
 ```sql
-create temp table _dbt_ext_src as (
+CREATE TEMP TABLE _dbt_ext_src AS (
   <model sql, with @parameters>
 );
-merge into <target> ... using (select * from _dbt_ext_src) ...
+MERGE INTO <target> ... USING (SELECT * FROM _dbt_ext_src) ...
 ```
 
 `CREATE TEMP TABLE` lives in that script's job, so concurrent `execute_ext` workers do not see each other's temp tables. Each merge writes only its own rows into the shared target. `unique_key` is optional: with it, matched rows update; without it, the merge is insert-only (append), same as regular `incremental` + `merge`. `incremental_strategy` must be `merge` (the default).
+
+## Relation markers (`ref` / `source`)
+
+When a model sets `mark_relations=true`, or uses materialization `incremental_ext` / `script`, overridden `ref` / `source` return a Relation whose `render()` wraps the FQN via `relation_marker`:
+
+```sql
+/* <dlt-ref-dim_products> */`proj`.`ds`.`dim_products`/* <dlt-ref-dim_products> */
+/* <dlt-source-raw-jobs> */`proj`.`ds`.`jobs`/* <dlt-source-raw-jobs> */
+```
+
+Path metadata (`.database` / `.schema` / `.identifier`) stays the original. Ephemeral refs are unmarked. Materialization-time substitute of these markers is not implemented yet.
 
 ### Variable sets
 
@@ -245,8 +256,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post6` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post6` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post7` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post7` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -262,6 +273,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | `1.12.1.post4` | Fourth DataEng-only release, same upstream base |
 | `1.12.1.post5` | Fifth DataEng-only release, same upstream base |
 | `1.12.1.post6` | Sixth DataEng-only release, same upstream base |
+| `1.12.1.post7` | Seventh DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.

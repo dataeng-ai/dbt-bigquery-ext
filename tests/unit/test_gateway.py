@@ -62,16 +62,18 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
         conn = MagicMock()
         cur = MagicMock()
         conn.cursor.return_value = cur
-        # table does not exist
-        cur.fetchone.return_value = None
+
+        cur.execute.side_effect = [
+            Exception("relation \"public.dbt_model_log\" does not exist"),
+            None,
+            None,
+        ]
 
         gw = CloudSqlGateway(creds, cfg)
         with patch.object(gw, "connect", return_value=conn):
             status = gw.ensure_schema()
 
         self.assertEqual(status[gateway_schema.DBT_MODEL_LOG_TABLE], "created")
-        # CREATE TABLE + CREATE INDEX
-        self.assertGreaterEqual(cur.execute.call_count, 2)
 
     def test_ensure_skips_when_exists(self):
         creds = MagicMock()
@@ -83,7 +85,7 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
         conn = MagicMock()
         cur = MagicMock()
         conn.cursor.return_value = cur
-        cur.fetchone.return_value = (1,)
+        cur.execute.side_effect = None
 
         gw = CloudSqlGateway(creds, cfg)
         with patch.object(gw, "connect", return_value=conn):
@@ -91,9 +93,9 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
 
         self.assertEqual(status[gateway_schema.DBT_MODEL_LOG_TABLE], "exists")
         executed_sql = [c.args[0] for c in cur.execute.call_args_list]
-        self.assertTrue(any("information_schema" in sql.lower() for sql in executed_sql))
-        self.assertTrue(any("create index" in sql.lower() for sql in executed_sql))
+        self.assertTrue(any("select 1 from public.dbt_model_log" in sql.lower() for sql in executed_sql))
         self.assertFalse(any("create table" in sql.lower() for sql in executed_sql))
+        self.assertFalse(any("create index" in sql.lower() for sql in executed_sql))
 
 
 class TestGatewayCheckpoints(unittest.TestCase):
