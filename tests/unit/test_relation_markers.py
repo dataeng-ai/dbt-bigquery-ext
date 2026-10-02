@@ -3,39 +3,36 @@ from dbt.adapters.bigquery.relation import BigQueryRelation
 
 
 def test_make_relation_marker_id_from_list():
-    assert BigQueryAdapter.make_relation_marker_id("ref", ["dim_products"]) == "dlt-ref-dim_products"
+    assert BigQueryAdapter.make_relation_marker_id("ref", ["dim_products"]) == "ref:dim_products"
     assert (
         BigQueryAdapter.make_relation_marker_id("source", ["raw", "cv_jobs_raw"])
-        == "dlt-source-raw-cv_jobs_raw"
+        == "source:raw:cv_jobs_raw"
     )
 
 
 def test_make_relation_marker_id_sanitizes():
     assert (
         BigQueryAdapter.make_relation_marker_id("ref", ["pkg.name", "model-1"])
-        == "dlt-ref-pkg_name-model_1"
+        == "ref:pkg_name:model_1"
     )
 
 
 def test_relation_render_with_relation_marker():
     rel = BigQueryRelation.create(database="proj", schema="ds", identifier="tbl")
-    marked = rel.incorporate(relation_marker="dlt-ref-tbl")
+    marked = rel.incorporate(relation_marker="ref:tbl")
     assert marked.database == "proj"
     assert marked.schema == "ds"
     assert marked.identifier == "tbl"
-    assert (
-        marked.render()
-        == "/* <dlt-ref-tbl> */`proj`.`ds`.`tbl`/* <dlt-ref-tbl> */"
-    )
+    assert marked.render() == "/* <ref:tbl> */`proj`.`ds`.`tbl`/* <ref:tbl> */"
     assert str(marked) == marked.render()
 
 
 def test_relation_include_preserves_relation_marker():
     rel = BigQueryRelation.create(database="proj", schema="ds", identifier="tbl")
-    marked = rel.incorporate(relation_marker="dlt-source-raw-t")
+    marked = rel.incorporate(relation_marker="source:raw:t")
     without_db = marked.include(database=False)
-    assert without_db.relation_marker == "dlt-source-raw-t"
-    assert without_db.render() == "/* <dlt-source-raw-t> */`ds`.`tbl`/* <dlt-source-raw-t> */"
+    assert without_db.relation_marker == "source:raw:t"
+    assert without_db.render() == "/* <source:raw:t> */`ds`.`tbl`/* <source:raw:t> */"
 
 
 def test_unmarked_relation_render_unchanged():

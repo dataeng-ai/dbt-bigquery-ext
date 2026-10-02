@@ -48,8 +48,8 @@ MERGE INTO <target> ... USING (SELECT * FROM _dbt_ext_src) ...
 When a model sets `mark_relations=true`, or uses materialization `incremental_ext` / `script`, overridden `ref` / `source` return a Relation whose `render()` wraps the FQN via `relation_marker`:
 
 ```sql
-/* <dlt-ref-dim_products> */`proj`.`ds`.`dim_products`/* <dlt-ref-dim_products> */
-/* <dlt-source-raw-jobs> */`proj`.`ds`.`jobs`/* <dlt-source-raw-jobs> */
+/* <ref:dim_products> */`proj`.`ds`.`dim_products`/* <ref:dim_products> */
+/* <source:raw:jobs> */`proj`.`ds`.`jobs`/* <source:raw:jobs> */
 ```
 
 Path metadata (`.database` / `.schema` / `.identifier`) stays the original. Ephemeral refs are unmarked. Materialization-time substitute of these markers is not implemented yet.
@@ -256,8 +256,8 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 
 | String | Where | Example | Why |
 | --- | --- | --- | --- |
-| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post8` and aborts |
-| `pypi_version` | PyPI / wheel name | `1.12.1.post8` | DataEng release N on top of upstream `1.12.1` |
+| `version` | `dbt.adapters.bigquery.__version__` (what `dbt debug` parses) | `1.12.1` | dbt's semver rejects `1.12.1.post9` and aborts |
+| `pypi_version` | PyPI / wheel name | `1.12.1.post9` | DataEng release N on top of upstream `1.12.1` |
 
 `pypi_version` scheme:
 
@@ -275,6 +275,7 @@ Two version strings, because dbt and PyPI do not accept the same syntax.
 | `1.12.1.post6` | Sixth DataEng-only release, same upstream base |
 | `1.12.1.post7` | Seventh DataEng-only release, same upstream base |
 | `1.12.1.post8` | Eighth DataEng-only release, same upstream base |
+| `1.12.1.post9` | Ninth DataEng-only release, same upstream base |
 | `1.13.0.post1` | Rebased onto upstream `1.13.0` |
 
 On a rebase, set `version` to the new upstream number (`1.13.0`) and `pypi_version` to `1.13.0.post1`. Do not put `.postN` into `version`. Local versions (`1.12.1+dataeng.1`) cannot be uploaded to PyPI.

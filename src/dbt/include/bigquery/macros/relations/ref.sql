@@ -1,6 +1,6 @@
 {#
   Wrap builtins.ref so Relation.render() emits deterministic relation markers:
-    /* <dlt-ref-…> */`proj`.`ds`.`tbl`/* <dlt-ref-…> */
+    /* <ref:…> */`proj`.`ds`.`tbl`/* <ref:…> */
 
   Active when mark_relations=true, or materialized in (incremental_ext, script).
   Ephemeral CTEs are unmarked.

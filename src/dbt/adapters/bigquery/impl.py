@@ -256,7 +256,8 @@ class BigQueryAdapter(BaseAdapter):
             *extra: Additional name parts after ``parts``.
 
         Returns:
-            Token such as ``dlt-ref-dim_products`` (non-alphanumeric chars replaced).
+            Token such as ``ref:dim_products`` or ``source:raw:jobs`` (parts joined
+            by ``:``; non-alphanumeric chars in each part replaced with ``_``).
 
         Raises:
             DbtRuntimeError: If no usable name parts are provided.
@@ -277,7 +278,8 @@ class BigQueryAdapter(BaseAdapter):
             raise dbt_common.exceptions.DbtRuntimeError(
                 f"make_relation_marker_id requires at least one part (kind={kind!r})"
             )
-        return f"dlt-{kind}-{'-'.join(cleaned)}"
+        kind_clean = re.sub(r"[^A-Za-z0-9_]+", "_", str(kind)).strip("_")
+        return f"{kind_clean}:{':'.join(cleaned)}"
 
     @available
     def mark_relation(self, relation: BigQueryRelation, marker: str) -> BigQueryRelation:
@@ -285,7 +287,7 @@ class BigQueryAdapter(BaseAdapter):
 
         Args:
             relation: Relation to mark.
-            marker: Marker id (e.g. ``dlt-ref-dim_products``).
+            marker: Marker id (e.g. ``ref:dim_products``).
 
         Returns:
             Relation with ``relation_marker`` set, or the input when ``marker`` is

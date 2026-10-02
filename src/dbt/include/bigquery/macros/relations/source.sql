@@ -1,6 +1,6 @@
 {#
   Wrap builtins.source so Relation.render() emits deterministic relation markers:
-    /* <dlt-source-…> */`proj`.`ds`.`tbl`/* <dlt-source-…> */
+    /* <source:…> */`proj`.`ds`.`tbl`/* <source:…> */
 
   Active when mark_relations=true, or materialized in (incremental_ext, script).
 #}
