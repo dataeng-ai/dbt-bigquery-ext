@@ -58,3 +58,9 @@ def test_should_mark_relations():
     assert fn(None, Cfg(materialized="table")) is False
     assert fn(None, Cfg(materialized="table", mark_relations=True)) is True
     assert fn(None, Cfg(materialized="incremental_ext", mark_relations=False)) is False
+
+
+def test_marker_helpers_are_available_on_adapter():
+    assert "should_mark_relations" in BigQueryAdapter._available_
+    assert "make_relation_marker_id" in BigQueryAdapter._available_
+    assert "mark_relation" in BigQueryAdapter._available_

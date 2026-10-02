@@ -245,6 +245,7 @@ class BigQueryAdapter(BaseAdapter):
         self._gateway_ensured = False
         self._gateway_lock = threading.RLock()
 
+    @available
     @staticmethod
     def make_relation_marker_id(kind: str, parts: Any, *extra: Any) -> str:
         """Build a stable marker token for Relation.render() comments.
@@ -278,6 +279,7 @@ class BigQueryAdapter(BaseAdapter):
             )
         return f"dlt-{kind}-{'-'.join(cleaned)}"
 
+    @available
     def mark_relation(self, relation: BigQueryRelation, marker: str) -> BigQueryRelation:
         """Attach a relation_marker so Relation.render() wraps the FQN.
 
@@ -295,6 +297,7 @@ class BigQueryAdapter(BaseAdapter):
             return relation
         return relation.incorporate(relation_marker=marker)
 
+    @available
     def should_mark_relations(self, config: Any = None) -> bool:
         """Return whether ref/source should attach relation_marker on render.
 
