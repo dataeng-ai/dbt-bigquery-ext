@@ -95,6 +95,21 @@
   {%- endif -%}
 {% endmacro %}
 
+{#
+  Build the incremental_ext script: CREATE TEMP from model SQL, then merge
+  (or insert_overwrite).
+
+  For insert_overwrite, DELETE + MERGE run inside a BigQuery multi-statement
+  transaction so a failed MERGE rolls back and does not leave the partition
+  empty. CREATE TEMP stays outside the transaction (session-local only).
+
+  Args:
+    target_relation: Destination relation.
+    compiled_code: Model SQL used to populate ``_dbt_ext_src``.
+    unique_key / partition_by / dest_columns / incremental_predicates: Merge inputs.
+    strategy: ``merge`` or ``insert_overwrite``.
+    partition_param_name: Optional execute_ext param name for the partition filter.
+#}
 {% macro bq_incremental_ext_script(
     target_relation,
     compiled_code,
@@ -135,10 +150,14 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name
       {{ compiled_code }}
   );
   {%- if strategy == 'insert_overwrite' %}
+  BEGIN TRANSACTION;
   DELETE FROM {{ target_relation }}
   WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name) }};
-  {%- endif %}
+  {{ merge_sql }};
+  COMMIT TRANSACTION;
+  {%- else %}
   {{ merge_sql }}
+  {%- endif %}
 {% endmacro %}
 
 {% materialization incremental_ext, adapter='bigquery', supported_languages=['sql'] -%}

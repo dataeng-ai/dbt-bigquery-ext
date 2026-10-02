@@ -84,13 +84,15 @@ Uses BigQuery `STRUCT(...) IS DISTINCT FROM STRUCT(...)` (null-safe; no JSON/has
 
 #### insert_overwrite
 
-Same `CREATE TEMP TABLE` as merge (model SQL unchanged). Then delete the matching
-partition bucket and merge only rows from that bucket:
+Same `CREATE TEMP TABLE` as merge (model SQL unchanged). Then, in a
+[multi-statement transaction](https://docs.cloud.google.com/bigquery/docs/transactions),
+delete the matching partition bucket and merge only rows from that bucket:
 
 ```sql
 CREATE TEMP TABLE _dbt_ext_src AS (
   <model sql, with @dt>
 );
+BEGIN TRANSACTION;
 DELETE FROM <target>
 WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY);  -- shape depends on data_type/granularity
 MERGE INTO <target> ...
@@ -98,7 +100,11 @@ USING (
   SELECT * FROM _dbt_ext_src
   WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY)
 ) ...
+;
+COMMIT TRANSACTION;
 ```
+
+If MERGE fails after DELETE, BigQuery rolls the transaction back so the partition is not left empty. `CREATE TEMP TABLE` stays outside (session-local only).
 
 (Exact predicate uses `{DATA_TYPE}_TRUNC(CAST(col AS …), GRAN)` when needed — e.g. `TIMESTAMP_TRUNC(..., HOUR)` — or `CAST(col AS DATE) = CAST(@param AS DATE)` for `date` + `day`. Both sides are cast so column storage type need not match `partition_by.data_type` exactly.)
 
