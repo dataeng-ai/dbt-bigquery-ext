@@ -29,7 +29,9 @@ class TestGatewayConfig(unittest.TestCase):
             }
         )
         self.assertIsInstance(cfg, CloudSqlGatewayConfig)
-        self.assertEqual(cfg.instance_connection_name, "my-gcp-project:us-central1:metadata")
+        self.assertEqual(
+            cfg.instance_connection_name, "my-gcp-project:us-central1:metadata"
+        )
         self.assertEqual(cfg.database, "metadata")
         self.assertTrue(cfg.init_on_connect)
         self.assertTrue(cfg.auto_migrate)
@@ -40,7 +42,9 @@ class TestGatewayConfig(unittest.TestCase):
 
     def test_iam_user_from_sa_email(self):
         self.assertEqual(
-            iam_db_user_from_email("dbt-runner@my-gcp-project.iam.gserviceaccount.com"),
+            iam_db_user_from_email(
+                "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+            ),
             "dbt-runner@my-gcp-project.iam",
         )
 
@@ -54,7 +58,9 @@ class TestGatewayConfig(unittest.TestCase):
 class TestGatewaySchemaEnsure(unittest.TestCase):
     def test_ensure_creates_when_missing(self):
         creds = MagicMock()
-        creds.impersonate_service_account = "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+        creds.impersonate_service_account = (
+            "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+        )
         cfg = CloudSqlGatewayConfig(
             instance_connection_name="my-gcp-project:us-central1:metadata"
         )
@@ -64,7 +70,7 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
         conn.cursor.return_value = cur
 
         cur.execute.side_effect = [
-            Exception("relation \"public.dbt_model_log\" does not exist"),
+            Exception('relation "public.dbt_model_log" does not exist'),
             None,
             None,
         ]
@@ -77,7 +83,9 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
 
     def test_ensure_skips_when_exists(self):
         creds = MagicMock()
-        creds.impersonate_service_account = "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+        creds.impersonate_service_account = (
+            "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+        )
         cfg = CloudSqlGatewayConfig(
             instance_connection_name="my-gcp-project:us-central1:metadata"
         )
@@ -93,7 +101,9 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
 
         self.assertEqual(status[gateway_schema.DBT_MODEL_LOG_TABLE], "exists")
         executed_sql = [c.args[0] for c in cur.execute.call_args_list]
-        self.assertTrue(any("select 1 from public.dbt_model_log" in sql.lower() for sql in executed_sql))
+        self.assertTrue(
+            any("select 1 from public.dbt_model_log" in sql.lower() for sql in executed_sql)
+        )
         self.assertFalse(any("create table" in sql.lower() for sql in executed_sql))
         self.assertFalse(any("create index" in sql.lower() for sql in executed_sql))
 
@@ -101,7 +111,9 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
 class TestGatewayCheckpoints(unittest.TestCase):
     def _gateway(self):
         creds = MagicMock()
-        creds.impersonate_service_account = "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+        creds.impersonate_service_account = (
+            "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+        )
         cfg = CloudSqlGatewayConfig(
             instance_connection_name="my-gcp-project:us-central1:metadata"
         )

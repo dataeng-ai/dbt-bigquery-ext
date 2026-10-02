@@ -47,6 +47,41 @@ MERGE INTO <target> ... USING (SELECT * FROM _dbt_ext_src) ...
 
 `CREATE TEMP TABLE` lives in that script's job, so concurrent `execute_ext` workers do not see each other's temp tables. Each merge writes only its own rows into the shared target. `unique_key` is optional: with it, matched rows update; without it, the merge is insert-only (append), same as regular `incremental` + `merge`.
 
+#### merge_skip_unchanged
+
+On `incremental` and `incremental_ext` with `incremental_strategy='merge'` and a `unique_key`, skip no-op updates when matched row data is unchanged:
+
+```sql
+WHEN MATCHED
+  AND (
+    STRUCT(DBT_INTERNAL_SOURCE.`name`, DBT_INTERNAL_SOURCE.`status`)
+    IS DISTINCT FROM
+    STRUCT(DBT_INTERNAL_DEST.`name`, DBT_INTERNAL_DEST.`status`)
+  )
+THEN UPDATE SET ...
+```
+
+Uses BigQuery `STRUCT(...) IS DISTINCT FROM STRUCT(...)` (null-safe; no JSON/hash). Compare columns must be groupable (not `GEOGRAPHY` / `JSON`, etc.).
+
+```sql
+{{ config(
+    materialized="incremental",  -- or incremental_ext
+    incremental_strategy="merge",
+    unique_key="id",
+    merge_skip_unchanged=true,
+    -- XOR: at most one of:
+    -- stable_columns=["name", "status"],           -- compare only these
+    -- unstable_columns=["__ingestion_time"],       -- compare all except these
+    -- neither → compare all target columns (minus unique_key)
+) }}
+```
+
+- Requires `unique_key`; rejected on `insert_overwrite` / `microbatch`
+- `unique_key` columns are omitted from the compare set automatically
+- Independent of `merge_update_columns` / `merge_exclude_columns` (those control the `SET` list)
+- First run / full refresh: no matched rows (or CTAS) → no-op for this predicate
+- Schema append: compare uses current `dest_columns` after schema sync
+
 #### insert_overwrite
 
 Same `CREATE TEMP TABLE` as merge (model SQL unchanged). Then delete the matching

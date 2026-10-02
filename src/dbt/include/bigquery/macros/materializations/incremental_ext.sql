@@ -151,6 +151,12 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name
       ~ "'insert_overwrite' (got '" ~ strategy ~ "')"
     ) %}
   {%- endif -%}
+  {%- if config.get('merge_skip_unchanged') and strategy != 'merge' -%}
+    {% do exceptions.raise_compiler_error(
+      "merge_skip_unchanged only applies to incremental_strategy 'merge' "
+      ~ "(got '" ~ strategy ~ "')"
+    ) %}
+  {%- endif -%}
 
   {%- set full_refresh_mode = should_full_refresh() -%}
   {%- set target_relation = this.incorporate(type='table') -%}

@@ -82,6 +82,13 @@
   {#-- Validate early so we don't run SQL if the strategy is invalid --#}
   {% set strategy = dbt_bigquery_validate_get_incremental_strategy(config) -%}
 
+  {%- if config.get('merge_skip_unchanged') and strategy != 'merge' -%}
+    {% do exceptions.raise_compiler_error(
+      "merge_skip_unchanged only applies to incremental_strategy 'merge' "
+      ~ "(got '" ~ strategy ~ "')"
+    ) %}
+  {%- endif -%}
+
   {%- set raw_partition_by = config.get('partition_by', none) -%}
   {%- set partition_by = adapter.parse_partition_by(raw_partition_by) -%}
   {%- set partitions = config.get('partitions', none) -%}
