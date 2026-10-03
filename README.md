@@ -319,11 +319,11 @@ IAM DB user for a service account is the SA email with `.gserviceaccount.com` st
 
 ### Startup
 
-On the first BigQuery connection (when `init_on_connect: true`), the adapter connects to Cloud SQL and:
+On the first BigQuery connection (when `init_on_connect: true`), the adapter connects to Cloud SQL and creates missing tables (see `gateway/schema.py`):
 
-1. Checks for `dbt_model_log`
-2. If missing → `CREATE TABLE` + index (see `gateway/schema.py`)
-3. If present → skip
+1. `dbt_model_log` (+ index)
+2. `change_tracking_registry`
+3. `change_tracking_log` (+ overlap / GIN indexes)
 
 Force early init from `dbt_project.yml`:
 
@@ -339,8 +339,65 @@ on-run-start:
 | `adapter.gateway_ensure()` | Connect + ensure tables |
 | `adapter.gateway_get_checkpoint(db, schema, table)` | Latest successful row (for pre-hooks) |
 | `adapter.gateway_set_checkpoint(...)` | Insert row (replaces `analytics.set_checkpoint` UDF) |
+| `adapter.gateway_change_metadata_pooler(relations, …)` | Pool CHANGES → registry/log + `gateway.pooler.*` checkpoints |
+| `adapter.gateway_get_affected_partitions(db, schema, table, start, end)` | Dirty partition ids (`None` = all, `[]` = none) |
 
-Jinja wrappers: `gateway_ensure`, `gateway_get_checkpoint`, `gateway_set_checkpoint`.
+Jinja wrappers: `gateway_ensure`, `gateway_get_checkpoint`, `gateway_set_checkpoint`, `gateway_pool_change_metadata`, `gateway_get_affected_partitions`.
+
+### Change-metadata pooler
+
+Mark models/sources to include them in the pool:
+
+```yaml
+# models/schema.yml or sources.yml
+models:
+  - name: orders
+    config:
+      enable_changetracking: true
+
+sources:
+  - name: raw
+    tables:
+      - name: events
+        meta:
+          enable_changetracking: true
+```
+
+Run once per invocation (typical) or from a script model:
+
+```yaml
+on-run-start:
+  - "{{ gateway_pool_change_metadata(worker_pool_size=0) }}"
+```
+
+For each distinct FQN the pooler:
+
+1. Reads partition type/field/grain from **BigQuery table metadata** (not dbt `partition_by`)
+2. Enables change history if needed
+3. On first see: logs `status=initial` with `partition_ids NULL` (entire table) and sets a `gateway.pooler.` checkpoint
+4. Later: runs a single `CHANGES` aggregation → string partition ids + `COUNT(*)` / `COUNTIF` per `_CHANGE_TYPE`, writes an append-only log row, advances the pooler checkpoint in the same Postgres transaction
+
+Partition id formats (UTC strings):
+
+| Grain | Example |
+| --- | --- |
+| hour | `2026-09-20 14:00:00` |
+| day / week / month | `2026-09-20` / week-start / month-start |
+
+`partition_ids` on the log:
+
+| Value | Meaning |
+| --- | --- |
+| `NULL` | Entire table / all partitions |
+| `{}` | No changes in the window |
+| `{id,…}` | Those partitions only |
+
+Query dirty partitions for a time range (overlap on log `delta_*`):
+
+```sql
+{% set parts = gateway_get_affected_partitions(ref('orders'), start_ts, end_ts) %}
+{# none → all table; [] → no changes; list → ids #}
+```
 
 Example commit (post-hook), after you switch off the remote UDF:
 

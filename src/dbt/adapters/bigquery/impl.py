@@ -1647,10 +1647,14 @@ class BigQueryAdapter(BaseAdapter):
             return self._gateway
 
     def _ensure_gateway_ready(self) -> Dict[str, str]:
+        from dbt.adapters.bigquery.gateway import schema as gateway_schema
+
         gateway = self._get_gateway()
         with self._gateway_lock:
             if self._gateway_ensured:
-                return {name: "exists" for name in ("dbt_model_log",)}
+                return {
+                    name: "exists" for name in gateway_schema.required_table_names()
+                }
             status = gateway.ensure_schema()
             self._gateway_ensured = True
             return status
@@ -1708,6 +1712,57 @@ class BigQueryAdapter(BaseAdapter):
             delta_end_time=delta_end_time,
             success=success,
             full_refresh=full_refresh,
+        )
+
+    @available.parse(lambda *a, **k: [])
+    def gateway_change_metadata_pooler(
+        self,
+        relations: Optional[List[Any]] = None,
+        worker_pool_size: int = 0,
+        write_bq: bool = False,
+        end_ts: Optional[str] = None,
+        invocation_id: Optional[str] = None,
+        bq_mirror_table: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Pool CHANGES metadata for relations into gateway change_tracking_* tables.
+
+        ``relations`` is a list of mappings with ``database``, ``schema``,
+        ``identifier`` (and optional ``node_id``). Partition field/grain come
+        from BigQuery table metadata, not dbt config.
+        """
+        from dbt.adapters.bigquery.gateway.pooler import ChangeMetadataPooler
+
+        self._ensure_gateway_ready()
+        return ChangeMetadataPooler(self).run(
+            relations=relations or [],
+            worker_pool_size=worker_pool_size,
+            write_bq=bool(write_bq),
+            end_ts=end_ts,
+            invocation_id=invocation_id,
+            bq_mirror_table=bq_mirror_table,
+        )
+
+    @available.parse(lambda *a, **k: None)
+    def gateway_get_affected_partitions(
+        self,
+        database: str,
+        schema: str,
+        table: str,
+        start_ts: str,
+        end_ts: str,
+    ) -> Optional[List[str]]:
+        """Affected partition ids for ``[start_ts, end_ts)`` overlap on pool log.
+
+        Returns:
+            ``None`` — entire table (NULL marker / unpartitioned / out_of_range / initial)
+            ``[]`` — no changes in range
+            ``list[str]`` — distinct partition id strings
+
+        Only meaningful when ``execute`` is true (parse/compile returns ``None``).
+        """
+        self._ensure_gateway_ready()
+        return self._get_gateway().get_affected_partitions(
+            database, schema, table, start_ts, end_ts
         )
 
     # This is used by the test suite

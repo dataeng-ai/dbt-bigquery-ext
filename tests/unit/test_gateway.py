@@ -69,17 +69,23 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
         cur = MagicMock()
         conn.cursor.return_value = cur
 
-        cur.execute.side_effect = [
-            Exception('relation "public.dbt_model_log" does not exist'),
-            None,
-            None,
-        ]
+        def _execute(sql, *args, **kwargs):
+            s = sql.lower() if isinstance(sql, str) else str(sql).lower()
+            if "select 1 from" in s and "limit 0" in s:
+                raise Exception('relation does not exist')
+            return None
+
+        cur.execute.side_effect = _execute
 
         gw = CloudSqlGateway(creds, cfg)
         with patch.object(gw, "connect", return_value=conn):
             status = gw.ensure_schema()
 
         self.assertEqual(status[gateway_schema.DBT_MODEL_LOG_TABLE], "created")
+        self.assertEqual(
+            status[gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE], "created"
+        )
+        self.assertEqual(status[gateway_schema.CHANGE_TRACKING_LOG_TABLE], "created")
 
     def test_ensure_skips_when_exists(self):
         creds = MagicMock()
@@ -100,12 +106,56 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
             status = gw.ensure_schema()
 
         self.assertEqual(status[gateway_schema.DBT_MODEL_LOG_TABLE], "exists")
+        self.assertEqual(
+            status[gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE], "exists"
+        )
+        self.assertEqual(status[gateway_schema.CHANGE_TRACKING_LOG_TABLE], "exists")
         executed_sql = [c.args[0] for c in cur.execute.call_args_list]
         self.assertTrue(
             any("select 1 from public.dbt_model_log" in sql.lower() for sql in executed_sql)
         )
         self.assertFalse(any("create table" in sql.lower() for sql in executed_sql))
         self.assertFalse(any("create index" in sql.lower() for sql in executed_sql))
+
+    def test_get_affected_partitions_null_vs_empty(self):
+        creds = MagicMock()
+        creds.impersonate_service_account = (
+            "dbt-runner@my-gcp-project.iam.gserviceaccount.com"
+        )
+        cfg = CloudSqlGatewayConfig(
+            instance_connection_name="my-gcp-project:us-central1:metadata"
+        )
+        gw = CloudSqlGateway(creds, cfg)
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value = cur
+
+        # One NULL marker → all
+        cur.fetchall.return_value = [(None,), (["2026-09-20"],)]
+        with patch.object(gw, "connect", return_value=conn):
+            self.assertIsNone(
+                gw.get_affected_partitions(
+                    "my-gcp-project",
+                    "analytics",
+                    "orders",
+                    "2026-09-20 00:00:00",
+                    "2026-09-21 00:00:00",
+                )
+            )
+
+        # Only empty arrays → no changes
+        cur.fetchall.return_value = [([],), ([],)]
+        with patch.object(gw, "connect", return_value=conn):
+            self.assertEqual(
+                gw.get_affected_partitions(
+                    "my-gcp-project",
+                    "analytics",
+                    "orders",
+                    "2026-09-20 00:00:00",
+                    "2026-09-21 00:00:00",
+                ),
+                [],
+            )
 
 
 class TestGatewayCheckpoints(unittest.TestCase):

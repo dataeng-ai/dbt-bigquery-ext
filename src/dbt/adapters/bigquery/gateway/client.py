@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
@@ -14,6 +14,13 @@ from dbt.adapters.bigquery.gateway.config import (
     iam_db_user_from_email,
 )
 from dbt.adapters.bigquery.gateway import schema as gateway_schema
+from dbt.adapters.bigquery.gateway.change_tracking import (
+    AFFECTED_PARTITION_STATUSES,
+    CHECKPOINT_ADVANCE_STATUSES,
+    merge_affected_partition_ids,
+    pooler_checkpoint_parts,
+    relation_full_name,
+)
 
 logger = AdapterLogger("BigQuery")
 
@@ -310,3 +317,316 @@ class CloudSqlGateway:
                 return row[0] if row else None
             finally:
                 cur.close()
+
+    def get_pooler_checkpoint(
+        self, project: str, dataset: str, table: str
+    ) -> Optional[Dict[str, Any]]:
+        db, schema, identifier = pooler_checkpoint_parts(project, dataset, table)
+        return self.get_checkpoint(db, schema, identifier)
+
+    def set_pooler_checkpoint(
+        self,
+        invocation_id: str,
+        project: str,
+        dataset: str,
+        table: str,
+        run_started_at: str,
+        node_started_at: str,
+        node_finished_at: str,
+        delta_start_time: str,
+        delta_end_time: str,
+        success: bool = True,
+    ) -> Any:
+        db, schema, identifier = pooler_checkpoint_parts(project, dataset, table)
+        return self.set_checkpoint(
+            invocation_id=invocation_id,
+            target_database=db,
+            target_schema=schema,
+            target_table_name=identifier,
+            run_started_at=run_started_at,
+            node_started_at=node_started_at,
+            node_finished_at=node_finished_at,
+            delta_start_time=delta_start_time,
+            delta_end_time=delta_end_time,
+            success=success,
+            full_refresh=False,
+        )
+
+    def upsert_change_tracking_registry(
+        self,
+        project: str,
+        dataset: str,
+        table: str,
+        partition_type: Optional[str],
+        partition_granularity: Optional[str],
+        partition_field: Optional[str],
+        change_history_enabled: Optional[bool],
+        last_status: Optional[str] = None,
+        last_pooled_at: Optional[str] = None,
+        conn=None,
+    ) -> None:
+        fqn = relation_full_name(project, dataset, table)
+        sql = f"""
+            INSERT INTO {self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)} (
+                full_table_name, project, dataset, table_name,
+                partition_type, partition_granularity, partition_field,
+                change_history_enabled, last_status, last_pooled_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (full_table_name) DO UPDATE SET
+                partition_type = EXCLUDED.partition_type,
+                partition_granularity = EXCLUDED.partition_granularity,
+                partition_field = EXCLUDED.partition_field,
+                change_history_enabled = EXCLUDED.change_history_enabled,
+                last_status = COALESCE(EXCLUDED.last_status, {self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)}.last_status),
+                last_pooled_at = COALESCE(EXCLUDED.last_pooled_at, {self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)}.last_pooled_at),
+                updated_at = CURRENT_TIMESTAMP
+        """
+        params = (
+            fqn,
+            project,
+            dataset,
+            table,
+            partition_type,
+            partition_granularity,
+            partition_field,
+            change_history_enabled,
+            last_status,
+            last_pooled_at,
+        )
+        if conn is not None:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, params)
+            finally:
+                cur.close()
+            return
+        with self.connection() as c:
+            cur = c.cursor()
+            try:
+                cur.execute(sql, params)
+            finally:
+                cur.close()
+
+    def insert_change_tracking_log(
+        self,
+        *,
+        project: str,
+        dataset: str,
+        table: str,
+        pooled_at: str,
+        delta_start_time: str,
+        delta_end_time: str,
+        partition_type: Optional[str],
+        partition_granularity: Optional[str],
+        partition_field: Optional[str],
+        rows_changed: Optional[int],
+        rows_insert: Optional[int],
+        rows_update: Optional[int],
+        rows_delete: Optional[int],
+        partitions_changed_cnt: Optional[int],
+        partition_ids: Optional[Sequence[str]],
+        status: str,
+        error: Optional[str] = None,
+        invocation_id: Optional[str] = None,
+        conn=None,
+    ) -> Any:
+        fqn = relation_full_name(project, dataset, table)
+        # pg8000 accepts list for TEXT[]; None stays SQL NULL (all).
+        ids_param: Any
+        if partition_ids is None:
+            ids_param = None
+        else:
+            ids_param = list(partition_ids)
+
+        sql = f"""
+            INSERT INTO {self._qualify(gateway_schema.CHANGE_TRACKING_LOG_TABLE)} (
+                full_table_name, pooled_at, delta_start_time, delta_end_time,
+                partition_type, partition_granularity, partition_field,
+                rows_changed, rows_insert, rows_update, rows_delete,
+                partitions_changed_cnt, partition_ids,
+                status, error, invocation_id
+            )
+            VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s,
+                %s, %s, %s
+            )
+            RETURNING id
+        """
+        params = (
+            fqn,
+            pooled_at,
+            delta_start_time,
+            delta_end_time,
+            partition_type,
+            partition_granularity,
+            partition_field,
+            rows_changed,
+            rows_insert,
+            rows_update,
+            rows_delete,
+            partitions_changed_cnt,
+            ids_param,
+            status,
+            error,
+            invocation_id,
+        )
+        if conn is not None:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                return row[0] if row else None
+            finally:
+                cur.close()
+
+        with self.connection() as c:
+            cur = c.cursor()
+            try:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                return row[0] if row else None
+            finally:
+                cur.close()
+
+    def commit_change_tracking_pool_result(
+        self,
+        *,
+        project: str,
+        dataset: str,
+        table: str,
+        pooled_at: str,
+        delta_start_time: str,
+        delta_end_time: str,
+        partition_type: Optional[str],
+        partition_granularity: Optional[str],
+        partition_field: Optional[str],
+        change_history_enabled: Optional[bool],
+        rows_changed: Optional[int],
+        rows_insert: Optional[int],
+        rows_update: Optional[int],
+        rows_delete: Optional[int],
+        partitions_changed_cnt: Optional[int],
+        partition_ids: Optional[Sequence[str]],
+        status: str,
+        error: Optional[str],
+        invocation_id: str,
+        run_started_at: str,
+        node_started_at: str,
+        node_finished_at: str,
+        advance_checkpoint: bool,
+    ) -> Any:
+        """Insert log + upsert registry (+ optional CP) in one Postgres transaction."""
+        with self.connection() as conn:
+            log_id = self.insert_change_tracking_log(
+                project=project,
+                dataset=dataset,
+                table=table,
+                pooled_at=pooled_at,
+                delta_start_time=delta_start_time,
+                delta_end_time=delta_end_time,
+                partition_type=partition_type,
+                partition_granularity=partition_granularity,
+                partition_field=partition_field,
+                rows_changed=rows_changed,
+                rows_insert=rows_insert,
+                rows_update=rows_update,
+                rows_delete=rows_delete,
+                partitions_changed_cnt=partitions_changed_cnt,
+                partition_ids=partition_ids,
+                status=status,
+                error=error,
+                invocation_id=invocation_id,
+                conn=conn,
+            )
+            self.upsert_change_tracking_registry(
+                project=project,
+                dataset=dataset,
+                table=table,
+                partition_type=partition_type,
+                partition_granularity=partition_granularity,
+                partition_field=partition_field,
+                change_history_enabled=change_history_enabled,
+                last_status=status,
+                last_pooled_at=pooled_at,
+                conn=conn,
+            )
+            if advance_checkpoint and status in CHECKPOINT_ADVANCE_STATUSES:
+                db, schema, identifier = pooler_checkpoint_parts(project, dataset, table)
+                fqn = full_target_table_name(db, schema, identifier)
+                sql = f"""
+                    INSERT INTO {self._qualify()} (
+                        invocation_id,
+                        target_database,
+                        target_schema,
+                        target_table_name,
+                        full_target_table_name,
+                        run_started_at,
+                        node_started_at,
+                        node_finished_at,
+                        success,
+                        full_refresh,
+                        delta_start_time,
+                        delta_end_time
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s
+                    )
+                """
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        sql,
+                        (
+                            invocation_id,
+                            db,
+                            schema,
+                            identifier,
+                            fqn,
+                            run_started_at,
+                            node_started_at,
+                            node_finished_at,
+                            True,
+                            False,
+                            delta_start_time,
+                            delta_end_time,
+                        ),
+                    )
+                finally:
+                    cur.close()
+            return log_id
+
+    def get_affected_partitions(
+        self,
+        project: str,
+        dataset: str,
+        table: str,
+        start_ts: str,
+        end_ts: str,
+    ) -> Optional[List[str]]:
+        """Return None (all), [] (no changes), or sorted partition id strings."""
+        fqn = relation_full_name(project, dataset, table)
+        status_list = ", ".join(f"'{s}'" for s in AFFECTED_PARTITION_STATUSES)
+        sql = f"""
+            SELECT partition_ids
+            FROM {self._qualify(gateway_schema.CHANGE_TRACKING_LOG_TABLE)}
+            WHERE full_table_name = %s
+              AND delta_start_time < %s
+              AND delta_end_time > %s
+              AND status IN ({status_list})
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (fqn, end_ts, start_ts))
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+
+        mapped = [{"partition_ids": r[0]} for r in rows]
+        return merge_affected_partition_ids(mapped)
