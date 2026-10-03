@@ -320,9 +320,22 @@ END;
     {%- if execute -%}
       {{ log('Writing runtime sql for node "' ~ model['unique_id'] ~ '"') }}
       {{ write(script_sql) }}
-      {%- set worker_pool_size = ext.get('worker_pool_size', 0) -%}
-      {%- if worker_pool_size is none -%}
-        {%- set worker_pool_size = 0 -%}
+      {#-
+        insert_overwrite wraps DELETE+MERGE in BEGIN TRANSACTION. BigQuery aborts
+        concurrent transactions against the same table, so parallel execute_ext
+        shards (different partitions) still collide. Force serial workers.
+      -#}
+      {%- set requested_workers = ext.get('worker_pool_size', 0) -%}
+      {%- if requested_workers is none -%}
+        {%- set requested_workers = 0 -%}
+      {%- endif -%}
+      {%- if requested_workers != 1 -%}
+        {{ log(
+          "incremental_ext insert_overwrite: forcing worker_pool_size=1 "
+          ~ "(requested " ~ requested_workers ~ ") — BigQuery rejects concurrent "
+          ~ "transactions on the same table",
+          info=true
+        ) }}
       {%- endif -%}
       {%- set res, table = adapter.execute_ext(
           script_sql,
@@ -330,7 +343,7 @@ END;
           fetch=false,
           variable_set_values=insert_overwrite_values,
           variable_set_types=insert_overwrite_types,
-          worker_pool_size=worker_pool_size,
+          worker_pool_size=1,
       ) -%}
       {{ store_result('main', response=res, agate_table=table) }}
     {%- endif -%}

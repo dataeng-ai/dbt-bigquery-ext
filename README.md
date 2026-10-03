@@ -131,6 +131,8 @@ END;
 
 If MERGE fails after DELETE, BigQuery rolls the transaction back so the partition is not left empty.
 
+BigQuery rejects **concurrent transactions** against the same table, so `insert_overwrite` always runs `execute_ext` with `worker_pool_size=1` (serial shards), even if you request parallel workers. Use `merge` when you need parallel fan-out.
+
 (Exact predicate uses `{DATA_TYPE}_TRUNC(CAST(col AS …), GRAN)` when needed — e.g. `TIMESTAMP_TRUNC(..., HOUR)` — or `CAST(col AS DATE) = CAST(@param AS DATE)` for `date` + `day`. Both sides are cast so column storage type need not match `partition_by.data_type` exactly.)
 
 This keeps temp creation identical to merge and applies the partition guard on the MERGE source (same place merge already reads `SELECT * FROM _dbt_ext_src`).
@@ -142,6 +144,7 @@ Requirements:
 - `execute_ext` required; each variable set has **exactly one** parameter (name may differ from `partition_by.field`, e.g. `@dt` vs column `__taken_at_utc`)
 - Parameter type `DATE` / `STRING` / `TIMESTAMP` / `DATETIME`; values coerce to the partition type. For `hour`, pass a timestamp/datetime (not date-only)
 - Variable sets are **deduped by partition bucket** (first wins) so duplicate days/hours do not race
+- `worker_pool_size` is forced to `1` (see above)
 - `unique_key` is not allowed
 - `copy_partitions` is not supported (see below)
 
