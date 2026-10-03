@@ -126,33 +126,37 @@ class CloudSqlGateway:
             except Exception:
                 pass
 
+    def _rollback(self, conn) -> None:
+        """Clear an aborted Postgres transaction (e.g. after a failed probe)."""
+        if hasattr(conn, "rollback"):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
     def _table_exists(self, conn, table: str) -> bool:
-        """Return True if the table is visible via SELECT (not only information_schema)."""
+        """Return True if the table is listed in information_schema.
+
+        Do **not** probe with ``SELECT … FROM <table>``: a missing table aborts the
+        current Postgres transaction (25P02), which then breaks subsequent CREATE.
+        """
         cur = conn.cursor()
         try:
             cur.execute(
-                f"SELECT 1 FROM {self._config.schema_name}.{table} LIMIT 0"
+                gateway_schema.TABLE_EXISTS_SQL,
+                (self._config.schema_name, table),
             )
-            return True
+            return cur.fetchone() is not None
         except Exception as exc:
+            self._rollback(conn)
             msg = str(exc).lower()
-            if "does not exist" in msg or "undefinedtable" in msg.replace(" ", ""):
-                return False
             if "permission denied" in msg or "42501" in str(exc):
                 raise DbtRuntimeError(
                     f"gateway: IAM user {self._iam_user!r} cannot access "
-                    f"{self._config.schema_name}.{table} ({exc}). "
-                    f'Grant SELECT, INSERT (and USAGE on schema {self._config.schema_name}) '
-                    f"to that role."
+                    f"information_schema for {self._config.schema_name}.{table} ({exc}). "
+                    f"Grant USAGE on schema {self._config.schema_name} to that role."
                 ) from exc
-            try:
-                cur.execute(
-                    gateway_schema.TABLE_EXISTS_SQL,
-                    (self._config.schema_name, table),
-                )
-                return cur.fetchone() is not None
-            except Exception:
-                raise
+            raise
         finally:
             cur.close()
 
@@ -184,6 +188,7 @@ class CloudSqlGateway:
                                 )
                                 cur.execute(sql)
                         except Exception as exc:
+                            self._rollback(conn)
                             if self._table_exists(conn, table):
                                 status[table] = "exists"
                                 logger.warning(

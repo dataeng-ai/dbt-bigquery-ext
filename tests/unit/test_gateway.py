@@ -68,14 +68,8 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
         conn = MagicMock()
         cur = MagicMock()
         conn.cursor.return_value = cur
-
-        def _execute(sql, *args, **kwargs):
-            s = sql.lower() if isinstance(sql, str) else str(sql).lower()
-            if "select 1 from" in s and "limit 0" in s:
-                raise Exception('relation does not exist')
-            return None
-
-        cur.execute.side_effect = _execute
+        # information_schema: no row → missing → CREATE
+        cur.fetchone.return_value = None
 
         gw = CloudSqlGateway(creds, cfg)
         with patch.object(gw, "connect", return_value=conn):
@@ -86,6 +80,17 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
             status[gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE], "created"
         )
         self.assertEqual(status[gateway_schema.CHANGE_TRACKING_LOG_TABLE], "created")
+        executed_sql = [c.args[0] for c in cur.execute.call_args_list]
+        self.assertTrue(any("information_schema.tables" in sql.lower() for sql in executed_sql))
+        self.assertTrue(any("create table" in sql.lower() for sql in executed_sql))
+        # Never probe missing tables with SELECT FROM <table> (aborts txn → 25P02)
+        self.assertFalse(
+            any(
+                "select 1 from public.dbt_model_log" in sql.lower()
+                or "select 1 from public.change_tracking" in sql.lower()
+                for sql in executed_sql
+            )
+        )
 
     def test_ensure_skips_when_exists(self):
         creds = MagicMock()
@@ -99,7 +104,7 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
         conn = MagicMock()
         cur = MagicMock()
         conn.cursor.return_value = cur
-        cur.execute.side_effect = None
+        cur.fetchone.return_value = (1,)
 
         gw = CloudSqlGateway(creds, cfg)
         with patch.object(gw, "connect", return_value=conn):
@@ -112,7 +117,7 @@ class TestGatewaySchemaEnsure(unittest.TestCase):
         self.assertEqual(status[gateway_schema.CHANGE_TRACKING_LOG_TABLE], "exists")
         executed_sql = [c.args[0] for c in cur.execute.call_args_list]
         self.assertTrue(
-            any("select 1 from public.dbt_model_log" in sql.lower() for sql in executed_sql)
+            any("information_schema.tables" in sql.lower() for sql in executed_sql)
         )
         self.assertFalse(any("create table" in sql.lower() for sql in executed_sql))
         self.assertFalse(any("create index" in sql.lower() for sql in executed_sql))
