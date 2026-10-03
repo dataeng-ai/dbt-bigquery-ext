@@ -102,9 +102,14 @@
     DECLARE vars
     CREATE TEMP _dbt_ext_src
     [SET partition dates]          -- merge + time partition only
-    [BEGIN TRANSACTION; DELETE; MERGE; COMMIT]  -- insert_overwrite
+    [BEGIN TRANSACTION; DELETE; MERGE; COMMIT]  -- insert_overwrite + consistency
+    [DELETE; MERGE]                -- insert_overwrite + scalability
     [MERGE]                        -- merge
   END
+
+  insert_overwrite_mode:
+    consistency (default) — wrap DELETE+MERGE in a transaction (serial workers)
+    scalability — no transaction; allows parallel execute_ext shards
 #}
 {% macro bq_incremental_ext_script(
     target_relation,
@@ -114,10 +119,12 @@
     dest_columns,
     incremental_predicates,
     strategy='merge',
-    partition_param_name=none
+    partition_param_name=none,
+    use_transaction=true
 ) %}
   {#- ----- logic (no SQL emission) ----- -#}
   {%- set is_overwrite = (strategy == 'insert_overwrite') -%}
+  {%- set wrap_txn = is_overwrite and use_transaction -%}
   {%- set use_partition_var = bq_merge_supports_partition_predicate(partition_by) -%}
   {%- set set_partition_var = use_partition_var and (not is_overwrite) -%}
 
@@ -181,6 +188,7 @@ BEGIN
   {{ set_partition_dates_sql }}
 {% endif %}
 {% if is_overwrite %}
+{% if wrap_txn %}
 
   BEGIN TRANSACTION;
 
@@ -190,6 +198,13 @@ BEGIN
   {{ merge_sql }};
 
   COMMIT TRANSACTION;
+{% else %}
+
+  DELETE FROM {{ target_relation }}
+  WHERE {{ delete_predicate }};
+
+  {{ merge_sql }};
+{% endif %}
 {% else %}
 
   {{ merge_sql }};
@@ -305,6 +320,19 @@ END;
 
   {%- set dest_columns = adapter.get_columns_in_relation(target_relation) -%}
 
+  {%- set insert_overwrite_mode = 'consistency' -%}
+  {%- set use_transaction = true -%}
+  {%- if strategy == 'insert_overwrite' -%}
+    {%- set insert_overwrite_mode = (config.get('insert_overwrite_mode') or 'consistency') | lower -%}
+    {%- if insert_overwrite_mode not in ['consistency', 'scalability'] -%}
+      {% do exceptions.raise_compiler_error(
+        "insert_overwrite_mode must be 'consistency' or 'scalability' "
+        ~ "(got '" ~ insert_overwrite_mode ~ "')"
+      ) %}
+    {%- endif -%}
+    {%- set use_transaction = (insert_overwrite_mode == 'consistency') -%}
+  {%- endif -%}
+
   {%- set script_sql = bq_incremental_ext_script(
       target_relation,
       compiled_code,
@@ -313,29 +341,36 @@ END;
       dest_columns,
       incremental_predicates,
       strategy,
-      partition_param_name
+      partition_param_name,
+      use_transaction
   ) -%}
 
   {%- if strategy == 'insert_overwrite' -%}
     {%- if execute -%}
       {{ log('Writing runtime sql for node "' ~ model['unique_id'] ~ '"') }}
       {{ write(script_sql) }}
-      {#-
-        insert_overwrite wraps DELETE+MERGE in BEGIN TRANSACTION. BigQuery aborts
-        concurrent transactions against the same table, so parallel execute_ext
-        shards (different partitions) still collide. Force serial workers.
-      -#}
       {%- set requested_workers = ext.get('worker_pool_size', 0) -%}
       {%- if requested_workers is none -%}
         {%- set requested_workers = 0 -%}
       {%- endif -%}
-      {%- if requested_workers != 1 -%}
-        {{ log(
-          "incremental_ext insert_overwrite: forcing worker_pool_size=1 "
-          ~ "(requested " ~ requested_workers ~ ") — BigQuery rejects concurrent "
-          ~ "transactions on the same table",
-          info=true
-        ) }}
+      {#-
+        consistency: transactional DELETE+MERGE — BigQuery rejects concurrent
+        transactions on one table → force worker_pool_size=1.
+        scalability: no transaction → honor requested worker_pool_size (0 = threads).
+      -#}
+      {%- if use_transaction -%}
+        {%- set worker_pool_size = 1 -%}
+        {%- if requested_workers != 1 -%}
+          {{ log(
+            "incremental_ext insert_overwrite_mode=consistency: forcing "
+            ~ "worker_pool_size=1 (requested " ~ requested_workers ~ ") — "
+            ~ "BigQuery rejects concurrent transactions on the same table; "
+            ~ "use insert_overwrite_mode='scalability' for parallel shards",
+            info=true
+          ) }}
+        {%- endif -%}
+      {%- else -%}
+        {%- set worker_pool_size = requested_workers -%}
       {%- endif -%}
       {%- set res, table = adapter.execute_ext(
           script_sql,
@@ -343,7 +378,7 @@ END;
           fetch=false,
           variable_set_values=insert_overwrite_values,
           variable_set_types=insert_overwrite_types,
-          worker_pool_size=1,
+          worker_pool_size=worker_pool_size,
       ) -%}
       {{ store_result('main', response=res, agate_table=table) }}
     {%- endif -%}

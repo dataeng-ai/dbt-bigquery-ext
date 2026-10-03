@@ -79,10 +79,20 @@ class ChangeMetadataPooler:
         if not inv:
             inv = "00000000-0000-0000-0000-000000000000"
 
-        pool_size = resolve_worker_pool_size(worker_pool_size, len(deduped))
+        auto_size = getattr(
+            getattr(self._adapter, "config", None), "threads", None
+        )
+        if auto_size is None:
+            auto_size = getattr(
+                getattr(self._adapter.connections, "profile", None), "threads", None
+            )
+        pool_size = resolve_worker_pool_size(
+            worker_pool_size, len(deduped), auto_size=auto_size
+        )
         logger.debug(
             f"change_metadata_pooler: {len(deduped)} relation(s), "
-            f"worker_pool_size={worker_pool_size} (resolved={pool_size})"
+            f"worker_pool_size={worker_pool_size} "
+            f"(resolved={pool_size}, threads={auto_size})"
         )
 
         results: Dict[int, Dict[str, Any]] = {}

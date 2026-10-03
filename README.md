@@ -129,9 +129,12 @@ BEGIN
 END;
 ```
 
-If MERGE fails after DELETE, BigQuery rolls the transaction back so the partition is not left empty.
+`insert_overwrite_mode` chooses consistency vs parallel throughput:
 
-BigQuery rejects **concurrent transactions** against the same table, so `insert_overwrite` always runs `execute_ext` with `worker_pool_size=1` (serial shards), even if you request parallel workers. Use `merge` when you need parallel fan-out.
+| Mode | Behavior |
+| --- | --- |
+| `consistency` (default) | `BEGIN TRANSACTION` around DELETE+MERGE; `worker_pool_size` forced to `1` (BigQuery rejects concurrent transactions on one table) |
+| `scalability` | No transaction; parallel `execute_ext` shards allowed. If MERGE fails after DELETE, that partition may be left empty |
 
 (Exact predicate uses `{DATA_TYPE}_TRUNC(CAST(col AS …), GRAN)` when needed — e.g. `TIMESTAMP_TRUNC(..., HOUR)` — or `CAST(col AS DATE) = CAST(@param AS DATE)` for `date` + `day`. Both sides are cast so column storage type need not match `partition_by.data_type` exactly.)
 
@@ -144,7 +147,7 @@ Requirements:
 - `execute_ext` required; each variable set has **exactly one** parameter (name may differ from `partition_by.field`, e.g. `@dt` vs column `__taken_at_utc`)
 - Parameter type `DATE` / `STRING` / `TIMESTAMP` / `DATETIME`; values coerce to the partition type. For `hour`, pass a timestamp/datetime (not date-only)
 - Variable sets are **deduped by partition bucket** (first wins) so duplicate days/hours do not race
-- `worker_pool_size` is forced to `1` (see above)
+- Optional `insert_overwrite_mode`: `consistency` \| `scalability`
 - `unique_key` is not allowed
 - `copy_partitions` is not supported (see below)
 
@@ -154,10 +157,11 @@ Requirements:
 {{ config(
     materialized="incremental_ext",
     incremental_strategy="insert_overwrite",
+    insert_overwrite_mode="scalability",  -- or "consistency" (default)
     partition_by={"field": "__taken_at_utc", "data_type": "datetime", "granularity": "day"},
     execute_ext={
         "variable_set_sql": "SELECT dt FROM UNNEST([DATE '2026-09-01', DATE '2026-09-03']) AS dt",
-        "worker_pool_size": 0,
+        "worker_pool_size": 0,  -- auto = dbt threads / --threads
     },
 ) }}
 
@@ -423,7 +427,7 @@ Example commit (post-hook), after you switch off the remote UDF:
 
 | Value | Workers |
 | --- | --- |
-| `0` (default) | auto, currently 16 |
+| `0` (default) | auto = dbt `threads` / `--threads` (capped at job count; fallback 16) |
 | `-1` | one worker per variable set |
 | `> 0` | that many workers (maximum 1024) |
 

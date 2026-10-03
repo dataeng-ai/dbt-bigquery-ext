@@ -16,7 +16,7 @@ from google.cloud.bigquery import ArrayQueryParameter, ScalarQueryParameter, Str
 
 from dbt_common.exceptions import DbtRuntimeError
 
-# Auto parallelism when worker_pool_size == 0
+# Fallback when worker_pool_size == 0 and dbt threads are unavailable
 AUTO_WORKER_POOL_SIZE = 16
 # Hard ceiling to avoid accidental thread storms from bad Jinja inputs
 MAX_WORKER_POOL_SIZE = 1024
@@ -47,8 +47,18 @@ _SCALAR_TYPES = frozenset(
 _COMPLEX_TYPE_PREFIXES = ("ARRAY", "STRUCT")
 
 
-def resolve_worker_pool_size(worker_pool_size: Any, num_jobs: int) -> int:
-    """Resolve pool size: 0=auto(16), -1=len(jobs), >0=explicit."""
+def resolve_worker_pool_size(
+    worker_pool_size: Any,
+    num_jobs: int,
+    auto_size: Optional[int] = None,
+) -> int:
+    """Resolve pool size: 0=auto (dbt threads), -1=len(jobs), >0=explicit.
+
+    When ``worker_pool_size == 0``, prefer ``auto_size`` (typically
+    ``profile.threads`` / ``--threads``). Fall back to
+    ``AUTO_WORKER_POOL_SIZE`` if ``auto_size`` is missing or non-positive.
+    Auto mode is capped at ``num_jobs``.
+    """
     if isinstance(worker_pool_size, bool) or not isinstance(worker_pool_size, int):
         raise DbtRuntimeError(
             f"worker_pool_size must be an int (-1, 0, or >0); got {worker_pool_size!r} "
@@ -62,7 +72,14 @@ def resolve_worker_pool_size(worker_pool_size: Any, num_jobs: int) -> int:
     if num_jobs <= 0:
         return 1
     if worker_pool_size == 0:
-        return AUTO_WORKER_POOL_SIZE
+        if isinstance(auto_size, bool) or (
+            auto_size is not None and not isinstance(auto_size, int)
+        ):
+            raise DbtRuntimeError(
+                f"auto_size must be a positive int or None; got {auto_size!r}"
+            )
+        auto = auto_size if (auto_size is not None and auto_size > 0) else AUTO_WORKER_POOL_SIZE
+        return max(1, min(auto, num_jobs))
     if worker_pool_size == -1:
         return num_jobs
     if worker_pool_size > MAX_WORKER_POOL_SIZE:

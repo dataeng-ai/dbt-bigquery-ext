@@ -538,7 +538,7 @@ class BigQueryConnectionManager(BaseConnectionManager):
         When none is set, behaves like ``execute``.
 
         worker_pool_size:
-          * 0  — auto parallelism (16 workers)
+          * 0  — auto parallelism (dbt ``threads`` / ``--threads``)
           * -1 — one worker per variable set (unlimited relative to the batch)
           * >0 — explicit pool size
 
@@ -568,11 +568,15 @@ class BigQueryConnectionManager(BaseConnectionManager):
                 agate_helper.empty_table(),
             )
 
-        pool_size = resolve_worker_pool_size(worker_pool_size, len(variable_sets))
+        auto_size = getattr(self.profile, "threads", None)
+        pool_size = resolve_worker_pool_size(
+            worker_pool_size, len(variable_sets), auto_size=auto_size
+        )
         logger.debug(
             f"execute_ext: starting {len(variable_sets)} parameterized quer"
             f"{'y' if len(variable_sets) == 1 else 'ies'} "
-            f"with worker_pool_size={worker_pool_size} (resolved={pool_size})"
+            f"with worker_pool_size={worker_pool_size} "
+            f"(resolved={pool_size}, threads={auto_size})"
         )
 
         # Preserve parent-thread connection attrs (timeout / reservation) for workers.

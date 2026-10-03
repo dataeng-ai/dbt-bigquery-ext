@@ -24,8 +24,15 @@ from dbt.adapters.bigquery.query_parameters import (
 
 
 class TestQueryParameters(unittest.TestCase):
-    def test_resolve_worker_pool_size_auto(self):
+    def test_resolve_worker_pool_size_auto_fallback(self):
         self.assertEqual(resolve_worker_pool_size(0, 100), AUTO_WORKER_POOL_SIZE)
+        self.assertEqual(resolve_worker_pool_size(0, 100, auto_size=None), AUTO_WORKER_POOL_SIZE)
+        self.assertEqual(resolve_worker_pool_size(0, 100, auto_size=0), AUTO_WORKER_POOL_SIZE)
+
+    def test_resolve_worker_pool_size_auto_threads(self):
+        self.assertEqual(resolve_worker_pool_size(0, 100, auto_size=8), 8)
+        # capped at job count
+        self.assertEqual(resolve_worker_pool_size(0, 3, auto_size=8), 3)
 
     def test_resolve_worker_pool_size_unlimited(self):
         self.assertEqual(resolve_worker_pool_size(-1, 7), 7)
@@ -42,6 +49,8 @@ class TestQueryParameters(unittest.TestCase):
             resolve_worker_pool_size("8", 1)
         with self.assertRaises(DbtRuntimeError):
             resolve_worker_pool_size(MAX_WORKER_POOL_SIZE + 1, 1)
+        with self.assertRaises(DbtRuntimeError):
+            resolve_worker_pool_size(0, 1, auto_size=True)
 
     def test_infer_scalar_types(self):
         self.assertEqual(infer_scalar_type("a", True), "BOOL")
