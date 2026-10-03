@@ -171,3 +171,54 @@
     ({{ dest_cols_csv }})
 
 {% endmacro %}
+
+
+{% macro bq_generate_incremental_merge_build_sql(
+    tmp_relation, target_relation, sql, unique_key, partition_by, dest_columns, tmp_relation_exists, incremental_predicates
+) %}
+    {%- set source_sql -%}
+        {%- if tmp_relation_exists -%}
+        (
+        SELECT
+        {% if partition_by.time_ingestion_partitioning -%}
+        {{ partition_by.insertable_time_partitioning_field() }},
+        {%- endif -%}
+        * FROM {{ tmp_relation }}
+        )
+        {%- else -%} {#-- wrap sql in parens to make it a subquery --#}
+        (
+            {%- if partition_by.time_ingestion_partitioning -%}
+            {{ wrap_with_time_ingestion_partitioning_sql(partition_by, sql, True) }}
+            {%- else -%}
+            {{sql}}
+            {%- endif %}
+        )
+        {%- endif -%}
+    {%- endset -%}
+
+    {%- set predicates = [] if incremental_predicates is none else [] + incremental_predicates -%}
+
+    {# Time-partitioned merge: prune dest via script variable populated from staging. #}
+    {%- set use_partition_var = tmp_relation_exists and bq_merge_supports_partition_predicate(partition_by) -%}
+    {%- if use_partition_var -%}
+        {%- do predicates.append(bq_merge_partition_predicate_from_var(partition_by)) -%}
+    {%- endif -%}
+
+    {%- set avoid_require_partition_filter = predicate_for_avoid_require_partition_filter() -%}
+    {%- if avoid_require_partition_filter is not none -%}
+        {% do predicates.append(avoid_require_partition_filter) %}
+    {%- endif -%}
+
+    {% set merge_sql = get_merge_sql(target_relation, source_sql, unique_key, dest_columns, predicates) %}
+
+    {%- if use_partition_var -%}
+      {% set build_sql %}
+{{ bq_wrap_merge_with_partition_dates(partition_by, tmp_relation, merge_sql) }}
+      {% endset %}
+    {%- else -%}
+      {% set build_sql = merge_sql %}
+    {%- endif -%}
+
+    {{ return(build_sql) }}
+
+{% endmacro %}

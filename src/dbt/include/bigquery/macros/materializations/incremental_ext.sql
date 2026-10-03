@@ -96,19 +96,15 @@
 {% endmacro %}
 
 {#
-  Build the incremental_ext script: CREATE TEMP from model SQL, then merge
-  (or insert_overwrite).
+  Build the incremental_ext BigQuery script (returned as a string).
 
-  For insert_overwrite, DELETE + MERGE run inside a BigQuery multi-statement
-  transaction so a failed MERGE rolls back and does not leave the partition
-  empty. CREATE TEMP stays outside the transaction (session-local only).
-
-  Args:
-    target_relation: Destination relation.
-    compiled_code: Model SQL used to populate ``_dbt_ext_src``.
-    unique_key / partition_by / dest_columns / incremental_predicates: Merge inputs.
-    strategy: ``merge`` or ``insert_overwrite``.
-    partition_param_name: Optional execute_ext param name for the partition filter.
+  Shape (always one BEGIN block):
+    DECLARE vars
+    CREATE TEMP _dbt_ext_src
+    [SET partition dates]          -- merge + time partition only
+    [BEGIN TRANSACTION; DELETE; MERGE; COMMIT]  -- insert_overwrite
+    [MERGE]                        -- merge
+  END
 #}
 {% macro bq_incremental_ext_script(
     target_relation,
@@ -120,14 +116,33 @@
     strategy='merge',
     partition_param_name=none
 ) %}
-  {%- if strategy == 'insert_overwrite' -%}
-    {%- set param_name = partition_param_name if partition_param_name is not none else partition_by.field -%}
+  {#- ----- logic (no SQL emission) ----- -#}
+  {%- set is_overwrite = (strategy == 'insert_overwrite') -%}
+  {%- set use_partition_var = bq_merge_supports_partition_predicate(partition_by) -%}
+  {%- set set_partition_var = use_partition_var and (not is_overwrite) -%}
+
+  {%- if partition_param_name is not none -%}
+    {%- set param_name = partition_param_name -%}
+  {%- elif partition_by is not none -%}
+    {%- set param_name = partition_by.field -%}
+  {%- else -%}
+    {%- set param_name = none -%}
+  {%- endif -%}
+
+  {%- set ext_predicates = [] if incremental_predicates is none else [] + incremental_predicates -%}
+
+  {%- if is_overwrite -%}
     {%- set source_sql -%}
 SELECT * FROM _dbt_ext_src
 WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name) }}
     {%- endset -%}
+    {%- set delete_predicate = bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name) -%}
   {%- else -%}
     {%- set source_sql = 'SELECT * FROM _dbt_ext_src' -%}
+    {%- set delete_predicate = none -%}
+    {%- if set_partition_var -%}
+      {%- do ext_predicates.append(bq_merge_partition_predicate_from_var(partition_by)) -%}
+    {%- endif -%}
   {%- endif -%}
 
   {%- set merge_sql = bq_generate_incremental_merge_build_sql(
@@ -138,26 +153,51 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name
       partition_by,
       dest_columns,
       false,
-      incremental_predicates
+      ext_predicates
   ) -%}
+
   {%- set sql_header = config.get('sql_header', none) -%}
   {%- if sql_header is not none -%}
     {%- set merge_sql = merge_sql | replace(sql_header, '') -%}
   {%- endif -%}
 
-  {{ sql_header if sql_header is not none }}
+  {%- if set_partition_var -%}
+    {%- set set_partition_dates_sql = bq_set_merge_partition_dates_from_relation(partition_by, '_dbt_ext_src') -%}
+  {%- else -%}
+    {%- set set_partition_dates_sql = none -%}
+  {%- endif -%}
+
+  {#- ----- SQL template ----- -#}
+  {%- set sql -%}
+{{ sql_header if sql_header is not none }}
+BEGIN
+  DECLARE _dbt_merge_partition_dates ARRAY<DATE>;
+
   CREATE TEMP TABLE _dbt_ext_src AS (
       {{ compiled_code }}
   );
-  {%- if strategy == 'insert_overwrite' %}
+{% if set_partition_dates_sql is not none %}
+
+  {{ set_partition_dates_sql }}
+{% endif %}
+{% if is_overwrite %}
+
   BEGIN TRANSACTION;
+
   DELETE FROM {{ target_relation }}
-  WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name) }};
+  WHERE {{ delete_predicate }};
+
   {{ merge_sql }};
+
   COMMIT TRANSACTION;
-  {%- else %}
-  {{ merge_sql }}
-  {%- endif %}
+{% else %}
+
+  {{ merge_sql }};
+{% endif %}
+END;
+  {%- endset -%}
+
+  {% do return(sql) %}
 {% endmacro %}
 
 {% materialization incremental_ext, adapter='bigquery', supported_languages=['sql'] -%}
@@ -265,18 +305,16 @@ WHERE {{ bq_ext_partition_bucket_eq(partition_by, partition_by.field, param_name
 
   {%- set dest_columns = adapter.get_columns_in_relation(target_relation) -%}
 
-  {%- set script_sql -%}
-    {{ bq_incremental_ext_script(
-        target_relation,
-        compiled_code,
-        unique_key,
-        partition_by,
-        dest_columns,
-        incremental_predicates,
-        strategy,
-        partition_param_name
-    ) }}
-  {%- endset -%}
+  {%- set script_sql = bq_incremental_ext_script(
+      target_relation,
+      compiled_code,
+      unique_key,
+      partition_by,
+      dest_columns,
+      incremental_predicates,
+      strategy,
+      partition_param_name
+  ) -%}
 
   {%- if strategy == 'insert_overwrite' -%}
     {%- if execute -%}

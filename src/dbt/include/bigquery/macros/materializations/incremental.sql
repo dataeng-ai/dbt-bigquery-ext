@@ -140,7 +140,11 @@
     {%- endif -%}
 
     {% set tmp_relation_exists = false %}
-    {% if on_schema_change != 'ignore' or language == 'python' %}
+    {# Always stage into __dbt_tmp for time-partitioned merge so we can DECLARE
+       partition dates from it (and for schema-change / python as before). #}
+    {% set force_tmp_for_merge_partitions =
+         strategy == 'merge' and bq_merge_supports_partition_predicate(partition_by) %}
+    {% if on_schema_change != 'ignore' or language == 'python' or force_tmp_for_merge_partitions %}
       {#-- Check first, since otherwise we may not build a temp table --#}
       {#-- Python always needs to create a temp table --#}
       {%- call statement('create_tmp_relation', language=language) -%}

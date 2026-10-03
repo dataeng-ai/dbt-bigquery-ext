@@ -39,13 +39,31 @@ Serial, once per run:
 The `main` statement is one BigQuery script per variable set:
 
 ```sql
-CREATE TEMP TABLE _dbt_ext_src AS (
-  <model sql, with @parameters>
-);
-MERGE INTO <target> ... USING (SELECT * FROM _dbt_ext_src) ...
+BEGIN
+  DECLARE _dbt_merge_partition_dates ARRAY<DATE>;
+
+  CREATE TEMP TABLE _dbt_ext_src AS (
+    <model sql, with @parameters>
+  );
+
+  SET _dbt_merge_partition_dates = (
+    SELECT ARRAY_AGG(dt) FROM (
+      SELECT DISTINCT DATE(<partition_field>) AS dt FROM _dbt_ext_src
+      WHERE <partition_field> IS NOT NULL
+    )
+  );
+
+  MERGE INTO <target> ... USING (SELECT * FROM _dbt_ext_src) ...
+    ON (...keys...)
+   AND DATE(DBT_INTERNAL_DEST.<partition_field>) IN UNNEST(
+         IFNULL(_dbt_merge_partition_dates, [DATE '1900-01-02'])
+       );
+END;
 ```
 
 `CREATE TEMP TABLE` lives in that script's job, so concurrent `execute_ext` workers do not see each other's temp tables. Each merge writes only its own rows into the shared target. `unique_key` is optional: with it, matched rows update; without it, the merge is insert-only (append), same as regular `incremental` + `merge`.
+
+**Partition predicates (always on for time-partitioned merge):** both `incremental` and `incremental_ext` load distinct `DATE(<partition_field>)` values from the staging relation into a script variable and filter with `IN UNNEST(...)` (verified to partition-prune on BigQuery). Regular `incremental` always builds `__dbt_tmp` for time-partitioned merge (even when `on_schema_change='ignore'`) so the MERGE script can `SET` the variable from it. Applies when `partition_by.data_type` is `date` / `timestamp` / `datetime` — no config flag.
 
 #### merge_skip_unchanged
 
@@ -84,27 +102,34 @@ Uses BigQuery `STRUCT(...) IS DISTINCT FROM STRUCT(...)` (null-safe; no JSON/has
 
 #### insert_overwrite
 
-Same `CREATE TEMP TABLE` as merge (model SQL unchanged). Then, in a
-[multi-statement transaction](https://docs.cloud.google.com/bigquery/docs/transactions),
-delete the matching partition bucket and merge only rows from that bucket:
+Same staging temp as merge, then DELETE + MERGE in a
+[transaction](https://docs.cloud.google.com/bigquery/docs/transactions):
 
 ```sql
-CREATE TEMP TABLE _dbt_ext_src AS (
-  <model sql, with @dt>
-);
-BEGIN TRANSACTION;
-DELETE FROM <target>
-WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY);  -- shape depends on data_type/granularity
-MERGE INTO <target> ...
-USING (
-  SELECT * FROM _dbt_ext_src
-  WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY)
-) ...
-;
-COMMIT TRANSACTION;
+BEGIN
+  DECLARE _dbt_merge_partition_dates ARRAY<DATE>;
+
+  CREATE TEMP TABLE _dbt_ext_src AS (
+    <model sql, with @dt>
+  );
+
+  BEGIN TRANSACTION;
+
+  DELETE FROM <target>
+  WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY);  -- shape depends on data_type/granularity
+
+  MERGE INTO <target> ...
+  USING (
+    SELECT * FROM _dbt_ext_src
+    WHERE DATETIME_TRUNC(CAST(dt AS DATETIME), DAY) = DATETIME_TRUNC(CAST(@dt AS DATETIME), DAY)
+  ) ...
+  ;
+
+  COMMIT TRANSACTION;
+END;
 ```
 
-If MERGE fails after DELETE, BigQuery rolls the transaction back so the partition is not left empty. `CREATE TEMP TABLE` stays outside (session-local only).
+If MERGE fails after DELETE, BigQuery rolls the transaction back so the partition is not left empty.
 
 (Exact predicate uses `{DATA_TYPE}_TRUNC(CAST(col AS …), GRAN)` when needed — e.g. `TIMESTAMP_TRUNC(..., HOUR)` — or `CAST(col AS DATE) = CAST(@param AS DATE)` for `date` + `day`. Both sides are cast so column storage type need not match `partition_by.data_type` exactly.)
 
