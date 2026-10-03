@@ -21,7 +21,7 @@
   {%- for node in graph.nodes.values() -%}
     {%- if node.resource_type in ['model', 'seed', 'snapshot']
           and _gateway_node_enable_changetracking(node)
-          and node.config.get('materialized') not in ['view', 'ephemeral'] -%}
+          and node.config.get('materialized') not in ['view', 'ephemeral', 'script'] -%}
       {%- set ident = node.alias if node.alias else node.name -%}
       {%- set key = node.database ~ '.' ~ node.schema ~ '.' ~ ident -%}
       {%- if key not in seen -%}
@@ -54,20 +54,34 @@
   {{ return(relations) }}
 {%- endmacro %}
 
-{% macro gateway_pool_change_metadata(worker_pool_size=0, write_bq=false, end_ts=none, bq_mirror_table=none) %}
+{% macro gateway_pool_change_metadata(
+    worker_pool_size=0,
+    write_bq=false,
+    end_ts=none,
+    bq_mirror_table=none,
+    return_results=false
+) %}
+  {# Hook-safe by default: returns '' so on-run-start does not execute the result as SQL.
+     Pass return_results=true when calling from a model/macro that needs the status list. #}
   {%- if not execute -%}
-    {{ return([]) }}
+    {{ return('' if not return_results else []) }}
   {%- endif -%}
 
   {%- set relations = _gateway_collect_changetracking_relations() -%}
-  {{ return(adapter.gateway_change_metadata_pooler(
+  {%- set results = adapter.gateway_change_metadata_pooler(
       relations,
       worker_pool_size=worker_pool_size,
       write_bq=write_bq,
       end_ts=end_ts,
       invocation_id=invocation_id,
       bq_mirror_table=bq_mirror_table
-  )) }}
+  ) -%}
+
+  {%- if return_results -%}
+    {{ return(results) }}
+  {%- else -%}
+    {{ return('') }}
+  {%- endif -%}
 {% endmacro %}
 
 {% macro gateway_get_affected_partitions(relation, start_ts, end_ts) %}

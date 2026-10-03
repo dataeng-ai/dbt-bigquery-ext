@@ -27,6 +27,17 @@ def _utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
+def _is_not_found_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if "not found" in msg and ("table" in msg or "404" in msg):
+        return True
+    # google.api_core.exceptions.NotFound
+    name = type(exc).__name__
+    if name == "NotFound":
+        return True
+    return False
+
+
 def _row_dict_from_agate(table: Any) -> Optional[Dict[str, Any]]:
     if table is None:
         return None
@@ -75,7 +86,7 @@ class ChangeMetadataPooler:
         )
 
         results: Dict[int, Dict[str, Any]] = {}
-        errors: Dict[int, BaseException] = {}
+        unexpected: Dict[int, BaseException] = {}
 
         def _one(index: int, rel: Mapping[str, Any]) -> Dict[str, Any]:
             return self._pool_one(
@@ -96,7 +107,7 @@ class ChangeMetadataPooler:
                 try:
                     results[idx] = fut.result()
                 except BaseException as exc:
-                    errors[idx] = exc
+                    unexpected[idx] = exc
                     rel = deduped[idx]
                     results[idx] = {
                         "full_table_name": relation_full_name(
@@ -117,14 +128,27 @@ class ChangeMetadataPooler:
                         "rows_delete": None,
                     }
 
-        if errors:
-            details = "; ".join(f"[{i}] {errors[i]}" for i in sorted(errors))
+        ordered = [results[i] for i in sorted(results)]
+        by_status: Dict[str, int] = {}
+        for row in ordered:
+            st = str(row.get("status") or "unknown")
+            by_status[st] = by_status.get(st, 0) + 1
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(by_status.items()))
+        logger.info(
+            f"change_metadata_pooler: finished {len(ordered)} relation(s) ({summary})"
+        )
+        if unexpected:
+            details = "; ".join(
+                f"[{i}] {unexpected[i]}" for i in sorted(unexpected)[:10]
+            )
+            more = len(unexpected) - min(len(unexpected), 10)
+            suffix = f" (+{more} more)" if more > 0 else ""
             logger.warning(
-                f"change_metadata_pooler: {len(errors)}/{len(deduped)} relation(s) "
-                f"raised unexpectedly: {details}"
+                f"change_metadata_pooler: {len(unexpected)}/{len(deduped)} relation(s) "
+                f"raised unexpectedly: {details}{suffix}"
             )
 
-        return [results[i] for i in sorted(results)]
+        return ordered
 
     def _pool_one(
         self,
@@ -148,7 +172,28 @@ class ChangeMetadataPooler:
         conn_name = f"change_pooler_{worker_index}"
         conn_mgr.set_connection_name(conn_name)
         try:
-            meta = self._load_partition_meta(project, dataset, table)
+            try:
+                meta = self._load_partition_meta(project, dataset, table)
+            except Exception as exc:
+                if _is_not_found_error(exc):
+                    # Table not built yet (common in personal schemas) — skip quietly.
+                    return {
+                        "full_table_name": fqn,
+                        "status": "not_found",
+                        "delta_start": None,
+                        "delta_end": end_ts,
+                        "partition_type": None,
+                        "partition_granularity": None,
+                        "partition_field": None,
+                        "partition_ids": None,
+                        "partitions_changed_cnt": None,
+                        "rows_changed": None,
+                        "rows_insert": None,
+                        "rows_update": None,
+                        "rows_delete": None,
+                        "error": str(exc),
+                    }
+                raise
             ch_enabled = self._ensure_change_history(project, dataset, table)
         finally:
             # Release after metadata/DDL; CHANGES may open the same name again.

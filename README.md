@@ -367,7 +367,8 @@ Run once per invocation (typical) or from a script model:
 
 ```yaml
 on-run-start:
-  - "{{ gateway_pool_change_metadata(worker_pool_size=0) }}"
+  # Use do / empty return — the status list must not be injected as SQL
+  - "{% do gateway_pool_change_metadata(worker_pool_size=0) %}"
 ```
 
 For each distinct FQN the pooler:
