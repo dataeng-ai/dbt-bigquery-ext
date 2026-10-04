@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from dbt.adapters.bigquery.gateway.pooler_core import PoolerFreshnessError
+
 from app.deps import get_bq_client, get_gateway, get_pooler, get_settings
 from app import permissions as perms
 from app.run_session import PoolRunSession
@@ -600,11 +602,14 @@ def partitions(
     ensure_fresh: bool = Query(default=True),
 ) -> Dict[str, Any]:
     pooler = get_pooler()
-    return pooler.ensure_affected_partitions(
-        project,
-        dataset,
-        table,
-        start,
-        end,
-        ensure_fresh=ensure_fresh,
-    )
+    try:
+        return pooler.ensure_affected_partitions(
+            project,
+            dataset,
+            table,
+            start,
+            end,
+            ensure_fresh=ensure_fresh,
+        )
+    except PoolerFreshnessError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

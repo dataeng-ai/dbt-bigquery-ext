@@ -36,6 +36,10 @@ from dbt.adapters.bigquery.query_parameters import resolve_worker_pool_size
 
 logger = logging.getLogger("dbt.adapters.bigquery.gateway.pooler_core")
 
+
+class PoolerFreshnessError(RuntimeError):
+    """ensure_fresh ran (or was needed) but watermark still does not reach ``end_ts``."""
+
 # Fallback when worker_pool_size == 0 and no auto_size provided
 _DEFAULT_AUTO_WORKERS = 16
 
@@ -295,12 +299,23 @@ class ChangeMetadataPoolerCore:
         if _ts_compare_lt(watermark, end_ts):
             coverage = "incomplete"
 
-        partition_ids = self._gateway.get_affected_partitions(
-            project, dataset, table, start_ts, end_ts
-        )
         status_summary = None
         if pool_results:
             status_summary = pool_results[0].get("status")
+
+        fqn = relation_full_name(project, dataset, table)
+        if ensure_fresh and coverage == "incomplete":
+            err = None
+            if pool_results:
+                err = pool_results[0].get("error")
+            raise PoolerFreshnessError(
+                f"change-metadata pooler could not cover [{start_ts}, {end_ts}) for {fqn}: "
+                f"watermark={watermark!r} status={status_summary!r} error={err!r}"
+            )
+
+        partition_ids = self._gateway.get_affected_partitions(
+            project, dataset, table, start_ts, end_ts
+        )
 
         return {
             "partition_ids": partition_ids,
@@ -308,7 +323,7 @@ class ChangeMetadataPoolerCore:
             "pooled": pooled,
             "coverage": coverage,
             "status_summary": status_summary,
-            "full_table_name": relation_full_name(project, dataset, table),
+            "full_table_name": fqn,
             "start_ts": start_ts,
             "end_ts": end_ts,
         }
@@ -382,6 +397,66 @@ class ChangeMetadataPoolerCore:
         fqn = relation_full_name(project, dataset, table)
         pooled_at = _utc_now_str()
 
+        lock_cm = getattr(self._gateway, "pooler_table_lock", None)
+        if callable(lock_cm):
+            with lock_cm(project, dataset, table):
+                return self._pool_one_locked(
+                    project,
+                    dataset,
+                    table,
+                    fqn=fqn,
+                    pooled_at=pooled_at,
+                    end_ts=end_ts,
+                    invocation_id=invocation_id,
+                    write_bq=write_bq,
+                    bq_mirror_table=bq_mirror_table,
+                )
+        return self._pool_one_locked(
+            project,
+            dataset,
+            table,
+            fqn=fqn,
+            pooled_at=pooled_at,
+            end_ts=end_ts,
+            invocation_id=invocation_id,
+            write_bq=write_bq,
+            bq_mirror_table=bq_mirror_table,
+        )
+
+    def _pool_one_locked(
+        self,
+        project: str,
+        dataset: str,
+        table: str,
+        *,
+        fqn: str,
+        pooled_at: str,
+        end_ts: str,
+        invocation_id: str,
+        write_bq: bool,
+        bq_mirror_table: Optional[str],
+    ) -> Dict[str, Any]:
+        cp = self._gateway.get_pooler_checkpoint(project, dataset, table)
+        if cp is not None:
+            existing = cp.get("delta_end_time")
+            if existing is not None and not _ts_compare_lt(str(existing), end_ts):
+                return {
+                    "full_table_name": fqn,
+                    "status": "skipped",
+                    "delta_start": str(existing),
+                    "delta_end": str(existing),
+                    "partition_type": None,
+                    "partition_granularity": None,
+                    "partition_field": None,
+                    "partition_ids": None,
+                    "partitions_changed_cnt": None,
+                    "rows_changed": None,
+                    "rows_insert": None,
+                    "rows_update": None,
+                    "rows_delete": None,
+                    "error": None,
+                }
+
         try:
             meta = self._bq.get_table_meta(project, dataset, table)
         except Exception as exc:
@@ -424,7 +499,6 @@ class ChangeMetadataPoolerCore:
 
         ch_enabled = self._ensure_change_history(project, dataset, table)
 
-        cp = self._gateway.get_pooler_checkpoint(project, dataset, table)
         if cp is None:
             status = "initial"
             delta_start = end_ts

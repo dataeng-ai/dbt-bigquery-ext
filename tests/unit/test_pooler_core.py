@@ -7,7 +7,10 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
 from dbt.adapters.bigquery.gateway.change_tracking import PartitionMeta
-from dbt.adapters.bigquery.gateway.pooler_core import ChangeMetadataPoolerCore
+from dbt.adapters.bigquery.gateway.pooler_core import (
+    ChangeMetadataPoolerCore,
+    PoolerFreshnessError,
+)
 
 
 class FakeBq:
@@ -44,7 +47,7 @@ class TestEnsureAffectedPartitions(unittest.TestCase):
 
         def _cp(*_a, **_k):
             calls["n"] += 1
-            if calls["n"] == 1:
+            if calls["n"] <= 2:
                 return {"delta_end_time": "2026-09-20 00:00:00.000000"}
             return {"delta_end_time": "2026-09-21 00:00:00.000000"}
 
@@ -102,6 +105,47 @@ class TestEnsureAffectedPartitions(unittest.TestCase):
         )
         self.assertFalse(out["pooled"])
         self.assertEqual(out["coverage"], "incomplete")
+
+    def test_raises_when_refresh_fails_to_cover(self):
+        gw = MagicMock()
+        gw.get_pooler_checkpoint.return_value = {
+            "delta_end_time": "2026-09-20 00:00:00.000000"
+        }
+        gw.commit_change_tracking_pool_result.side_effect = RuntimeError("boom")
+        core = ChangeMetadataPoolerCore(FakeBq(), gw, default_threads=1)
+        with self.assertRaises(PoolerFreshnessError) as ctx:
+            core.ensure_affected_partitions(
+                "my-gcp-project",
+                "analytics",
+                "orders",
+                "2026-09-19 00:00:00",
+                "2026-09-21 00:00:00",
+                ensure_fresh=True,
+            )
+        self.assertIn("could not cover", str(ctx.exception))
+        gw.get_affected_partitions.assert_not_called()
+
+    def test_skips_pool_when_lock_shows_already_fresh(self):
+        gw = MagicMock()
+        gw.get_pooler_checkpoint.return_value = {
+            "delta_end_time": "2026-09-21 00:00:00.000000"
+        }
+        bq = FakeBq()
+        core = ChangeMetadataPoolerCore(bq, gw, default_threads=1)
+        results = core.pool_relations(
+            [
+                {
+                    "database": "my-gcp-project",
+                    "schema": "analytics",
+                    "identifier": "orders",
+                }
+            ],
+            worker_pool_size=1,
+            end_ts="2026-09-21 00:00:00.000000",
+        )
+        self.assertEqual(results[0]["status"], "skipped")
+        gw.commit_change_tracking_pool_result.assert_not_called()
+        self.assertEqual(bq.queries, [])
 
 
 class TestPoolInitial(unittest.TestCase):

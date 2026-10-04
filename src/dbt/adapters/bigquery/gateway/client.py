@@ -126,6 +126,50 @@ class CloudSqlGateway:
             except Exception:
                 pass
 
+    @contextmanager
+    def pooler_table_lock(self, project: str, dataset: str, table: str):
+        """Session-level advisory lock for one table (survives commits; held until unlock).
+
+        Serializes scheduled / API / ensure-fresh pooling across Cloud Run instances.
+        CHANGES runs outside Postgres, so this cannot be a transaction lock.
+        """
+        fqn = relation_full_name(project, dataset, table)
+        sql_lock = (
+            "SELECT pg_advisory_lock("
+            "('x' || substr(md5(%s), 1, 16))::bit(64)::bigint)"
+        )
+        sql_unlock = (
+            "SELECT pg_advisory_unlock("
+            "('x' || substr(md5(%s), 1, 16))::bit(64)::bigint)"
+        )
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql_lock, (fqn,))
+                cur.fetchone()
+            finally:
+                cur.close()
+            if hasattr(conn, "commit"):
+                conn.commit()
+            yield
+        finally:
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute(sql_unlock, (fqn,))
+                    cur.fetchone()
+                finally:
+                    cur.close()
+                if hasattr(conn, "commit"):
+                    conn.commit()
+            except Exception:
+                logger.debug("gateway: advisory unlock failed for %s", fqn)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _rollback(self, conn) -> None:
         """Clear an aborted Postgres transaction (e.g. after a failed probe)."""
         if hasattr(conn, "rollback"):
