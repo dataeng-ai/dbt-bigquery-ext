@@ -40,6 +40,14 @@ Auth:
 IAP accessors: grant `roles/iap.httpsResourceAccessor` on the Cloud Run service
 (user, group, or `domain:example.com`).
 
+## Image
+
+Published with each `dbt-bigquery-ext` release:
+
+`ghcr.io/dataeng-ai/change-metadata-pooler:<pypi_version>`
+
+Example: `ghcr.io/dataeng-ai/change-metadata-pooler:1.12.1.post22`. Point Cloud Run at that tag (`gcloud run services update … --image=…`). Local `make publish` uploads PyPI and this image in parallel; GitHub Actions does the same on `v*` tags.
+
 ## Deploy (parameterized)
 
 Two equivalent paths — pick one; both take the same variables:

@@ -4,6 +4,7 @@ DataEng AI fork of [`dbt-bigquery`](https://github.com/dbt-labs/dbt-adapters/tre
 (based on **1.12.1**), published as a **drop-in replacement**.
 
 - **PyPI:** `dbt-bigquery-ext`
+- **Pooler image:** `ghcr.io/dataeng-ai/change-metadata-pooler:<pypi_version>` (same version as PyPI)
 - **Import / adapter type:** still `dbt.adapters.bigquery` / `type: bigquery` in profiles
 - **Do not install alongside** upstream `dbt-bigquery` (same Python package path)
 

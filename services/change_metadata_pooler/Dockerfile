@@ -2,6 +2,11 @@
 #   docker build -f services/change_metadata_pooler/Dockerfile -t change-metadata-pooler .
 FROM python:3.12-slim
 
+ARG PYPI_VERSION=0.0.0
+LABEL org.opencontainers.image.source="https://github.com/dataeng-ai/dbt-bigquery-ext" \
+      org.opencontainers.image.title="change-metadata-pooler" \
+      org.opencontainers.image.version="${PYPI_VERSION}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
