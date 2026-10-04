@@ -1714,6 +1714,11 @@ class BigQueryAdapter(BaseAdapter):
             full_refresh=full_refresh,
         )
 
+    def _get_pooler_url(self) -> Optional[str]:
+        from dbt.adapters.bigquery.gateway.config import parse_pooler_url
+
+        return parse_pooler_url(getattr(self.config.credentials, "gateway", None))
+
     @available.parse(lambda *a, **k: [])
     def gateway_change_metadata_pooler(
         self,
@@ -1729,7 +1734,20 @@ class BigQueryAdapter(BaseAdapter):
         ``relations`` is a list of mappings with ``database``, ``schema``,
         ``identifier`` (and optional ``node_id``). Partition field/grain come
         from BigQuery table metadata, not dbt config.
+
+        When ``gateway.pooler_url`` is set, delegates to the Cloud Run service.
         """
+        pooler_url = self._get_pooler_url()
+        if pooler_url:
+            from dbt.adapters.bigquery.gateway.http_client import PoolerHttpClient
+
+            return PoolerHttpClient(pooler_url).pool(
+                relations=relations or [],
+                end_ts=end_ts,
+                worker_pool_size=int(worker_pool_size or 0),
+                invocation_id=invocation_id,
+            )
+
         from dbt.adapters.bigquery.gateway.pooler import ChangeMetadataPooler
 
         self._ensure_gateway_ready()
@@ -1750,8 +1768,11 @@ class BigQueryAdapter(BaseAdapter):
         table: str,
         start_ts: str,
         end_ts: str,
+        ensure_fresh: bool = True,
     ) -> Optional[List[str]]:
         """Affected partition ids for ``[start_ts, end_ts)`` overlap on pool log.
+
+        When ``ensure_fresh`` (default), pools first if watermark ``W < end_ts``.
 
         Returns:
             ``None`` — entire table (NULL marker / unpartitioned / out_of_range / initial)
@@ -1760,10 +1781,32 @@ class BigQueryAdapter(BaseAdapter):
 
         Only meaningful when ``execute`` is true (parse/compile returns ``None``).
         """
+        pooler_url = self._get_pooler_url()
+        if pooler_url:
+            from dbt.adapters.bigquery.gateway.http_client import PoolerHttpClient
+
+            result = PoolerHttpClient(pooler_url).ensure_affected_partitions(
+                database,
+                schema,
+                table,
+                start_ts,
+                end_ts,
+                ensure_fresh=bool(ensure_fresh),
+            )
+            return result.get("partition_ids")
+
+        from dbt.adapters.bigquery.gateway.pooler import ChangeMetadataPooler
+
         self._ensure_gateway_ready()
-        return self._get_gateway().get_affected_partitions(
-            database, schema, table, start_ts, end_ts
+        result = ChangeMetadataPooler(self).ensure_affected_partitions(
+            database,
+            schema,
+            table,
+            start_ts,
+            end_ts,
+            ensure_fresh=bool(ensure_fresh),
         )
+        return result.get("partition_ids")
 
     # This is used by the test suite
     @available

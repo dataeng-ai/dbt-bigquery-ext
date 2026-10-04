@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+project                    = "my-gcp-project"
+region                     = "us-central1"
+image_tag                  = "manual"
+instance_connection_name   = "my-gcp-project:us-central1:metadata"
+cloudsql_iam_user          = "change-metadata-pooler@my-gcp-project.iam"
+bq_project                 = "my-gcp-project"
+# Prefer one of:
+# vpc_connector = "projects/my-gcp-project/locations/us-central1/connectors/my-connector"
+network = "projects/my-host-project/global/networks/my-vpc"
+subnet  = "projects/my-host-project/regions/us-central1/subnetworks/my-subnet"
+create_scheduler = true
+schedule         = "*/10 * * * *"

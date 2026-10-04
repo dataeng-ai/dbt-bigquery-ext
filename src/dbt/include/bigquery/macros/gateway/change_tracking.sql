@@ -84,7 +84,7 @@
   {%- endif -%}
 {% endmacro %}
 
-{% macro gateway_get_affected_partitions(relation, start_ts, end_ts) %}
+{% macro gateway_get_affected_partitions(relation, start_ts, end_ts, ensure_fresh=true) %}
   {%- if not execute -%}
     {{ return(none) }}
   {%- endif -%}
@@ -93,7 +93,8 @@
       relation.schema,
       relation.identifier,
       start_ts | string,
-      end_ts | string
+      end_ts | string,
+      ensure_fresh=ensure_fresh
   )) }}
 {% endmacro %}
 

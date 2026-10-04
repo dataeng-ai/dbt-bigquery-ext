@@ -45,6 +45,16 @@ class CloudSqlGatewayConfig:
             )
 
 
+def parse_pooler_url(raw: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Return ``gateway.pooler_url`` if set (Cloud Run base URL)."""
+    if not raw or not isinstance(raw, Mapping):
+        return None
+    url = raw.get("pooler_url") or raw.get("poolerUrl")
+    if not url:
+        return None
+    return str(url).rstrip("/")
+
+
 def parse_gateway_config(raw: Optional[Mapping[str, Any]]) -> Optional[CloudSqlGatewayConfig]:
     """Parse ``credentials.gateway`` from profiles.yml. Returns None if unset."""
     if not raw:
@@ -58,6 +68,9 @@ def parse_gateway_config(raw: Optional[Mapping[str, Any]]) -> Optional[CloudSqlG
         if "instance_connection_name" in raw:
             cloudsql = raw
         else:
+            # pooler_url-only gateway is valid when Cloud Run owns DB access
+            if parse_pooler_url(raw):
+                return None
             return None
 
     if not isinstance(cloudsql, Mapping):

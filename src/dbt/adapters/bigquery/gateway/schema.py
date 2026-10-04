@@ -12,6 +12,9 @@ from typing import Iterable, Sequence
 DBT_MODEL_LOG_TABLE = "dbt_model_log"
 CHANGE_TRACKING_REGISTRY_TABLE = "change_tracking_registry"
 CHANGE_TRACKING_LOG_TABLE = "change_tracking_log"
+CHANGE_TRACKING_RUN_TABLE = "change_tracking_run"
+CHANGE_TRACKING_RUN_EVENT_TABLE = "change_tracking_run_event"
+CHANGE_TRACKING_PERMISSION_ISSUE_TABLE = "change_tracking_permission_issue"
 
 CREATE_DBT_MODEL_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS {schema}.{table} (
@@ -52,12 +55,22 @@ CREATE TABLE IF NOT EXISTS {schema}.{table} (
     partition_granularity VARCHAR(32),
     partition_field VARCHAR(512),
     change_history_enabled BOOLEAN,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    schedule_group VARCHAR(128) NOT NULL DEFAULT 'default',
     registered_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    unregistered_at TIMESTAMP WITHOUT TIME ZONE,
     last_pooled_at TIMESTAMP WITHOUT TIME ZONE,
     last_status VARCHAR(64),
     updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """
+
+# Idempotent upgrades for registries created before schedule columns existed.
+MIGRATE_REGISTRY_COLUMNS_SQL: Sequence[str] = (
+    "ALTER TABLE {schema}.{table} ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE {schema}.{table} ADD COLUMN IF NOT EXISTS schedule_group VARCHAR(128) NOT NULL DEFAULT 'default'",
+    "ALTER TABLE {schema}.{table} ADD COLUMN IF NOT EXISTS unregistered_at TIMESTAMP WITHOUT TIME ZONE",
+)
 
 CREATE_CHANGE_TRACKING_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS {schema}.{table} (
@@ -106,6 +119,69 @@ ON {schema}.{table} USING GIN (partition_ids)
 WHERE partition_ids IS NOT NULL
 """
 
+CREATE_CHANGE_TRACKING_RUN_SQL = """
+CREATE TABLE IF NOT EXISTS {schema}.{table} (
+    id BIGSERIAL PRIMARY KEY,
+    started_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    completed_at TIMESTAMP WITHOUT TIME ZONE,
+    status VARCHAR(64) NOT NULL DEFAULT 'running',
+    watermark_from TIMESTAMP WITHOUT TIME ZONE,
+    watermark_to TIMESTAMP WITHOUT TIME ZONE,
+    num_tables INT NOT NULL DEFAULT 0,
+    num_warnings INT NOT NULL DEFAULT 0,
+    num_errors INT NOT NULL DEFAULT 0,
+    invocation_id CHAR(36),
+    trigger VARCHAR(64),
+    schedule_group VARCHAR(128),
+    summary TEXT,
+    _created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+CREATE_CHANGE_TRACKING_RUN_STARTED_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS IX_ctr_started_at
+ON {schema}.{table} (started_at DESC)
+"""
+
+CREATE_CHANGE_TRACKING_RUN_EVENT_SQL = """
+CREATE TABLE IF NOT EXISTS {schema}.{table} (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES {schema}.change_tracking_run(id) ON DELETE CASCADE,
+    logged_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    level VARCHAR(16) NOT NULL,
+    message TEXT NOT NULL,
+    full_table_name VARCHAR(2048),
+    status VARCHAR(64)
+)
+"""
+
+CREATE_CHANGE_TRACKING_RUN_EVENT_RUN_ID_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS IX_ctre_run_id
+ON {schema}.{table} (run_id, id)
+"""
+
+CREATE_CHANGE_TRACKING_PERMISSION_ISSUE_SQL = """
+CREATE TABLE IF NOT EXISTS {schema}.{table} (
+    id BIGSERIAL PRIMARY KEY,
+    project VARCHAR(512) NOT NULL,
+    dataset VARCHAR(512) NOT NULL,
+    sa_email VARCHAR(512) NOT NULL,
+    required_role VARCHAR(256) NOT NULL,
+    scope VARCHAR(32) NOT NULL DEFAULT 'dataset',
+    last_error TEXT,
+    status VARCHAR(32) NOT NULL DEFAULT 'open',
+    first_seen_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP WITHOUT TIME ZONE,
+    UNIQUE (project, dataset, sa_email, required_role, scope)
+)
+"""
+
+CREATE_CHANGE_TRACKING_PERMISSION_ISSUE_STATUS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS IX_ctpi_status_last_seen
+ON {schema}.{table} (status, last_seen_at DESC)
+"""
+
 TABLE_EXISTS_SQL = """
 SELECT 1
 FROM information_schema.tables
@@ -133,6 +209,27 @@ REQUIRED_TABLES: Sequence[tuple[str, Sequence[str]]] = (
             CREATE_CHANGE_TRACKING_LOG_PARTITION_IDS_GIN_SQL,
         ),
     ),
+    (
+        CHANGE_TRACKING_RUN_TABLE,
+        (
+            CREATE_CHANGE_TRACKING_RUN_SQL,
+            CREATE_CHANGE_TRACKING_RUN_STARTED_INDEX_SQL,
+        ),
+    ),
+    (
+        CHANGE_TRACKING_RUN_EVENT_TABLE,
+        (
+            CREATE_CHANGE_TRACKING_RUN_EVENT_SQL,
+            CREATE_CHANGE_TRACKING_RUN_EVENT_RUN_ID_INDEX_SQL,
+        ),
+    ),
+    (
+        CHANGE_TRACKING_PERMISSION_ISSUE_TABLE,
+        (
+            CREATE_CHANGE_TRACKING_PERMISSION_ISSUE_SQL,
+            CREATE_CHANGE_TRACKING_PERMISSION_ISSUE_STATUS_INDEX_SQL,
+        ),
+    ),
 )
 
 
@@ -145,9 +242,31 @@ def required_table_names() -> Iterable[str]:
 
 
 def migrate(conn, schema: str) -> None:
-    """Reserved: apply versioned migrations.
+    """Apply idempotent schema upgrades (registry schedule columns, etc.).
 
-    Today this is a no-op beyond ensure_schema. Keep the hook so callers and
-    profiles can pass ``auto_migrate`` without a breaking change later.
+    Skips statements the current role cannot run (e.g. non-owner ``ALTER TABLE``)
+    so shared metadata databases keep working for least-privilege IAM users.
     """
-    return None
+    table = CHANGE_TRACKING_REGISTRY_TABLE
+    cur = conn.cursor()
+    try:
+        for template in MIGRATE_REGISTRY_COLUMNS_SQL:
+            sql = format_ddl(template, schema, table)
+            try:
+                cur.execute(sql)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if (
+                    "must be owner" in msg
+                    or "42501" in str(exc)
+                    or "permission denied" in msg
+                ):
+                    if hasattr(conn, "rollback"):
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    continue
+                raise
+    finally:
+        cur.close()

@@ -353,7 +353,22 @@ Jinja wrappers: `gateway_ensure`, `gateway_get_checkpoint`, `gateway_set_checkpo
 
 ### Change-metadata pooler
 
-Mark models/sources to include them in the pool:
+**Production path:** deploy the Cloud Run service under
+[`services/change_metadata_pooler/`](services/change_metadata_pooler/) (register
+tables + Cloud Scheduler). Point the adapter at it:
+
+```yaml
+gateway:
+  cloudsql: { ... }   # still used for checkpoints / local fallback
+  pooler_url: https://change-metadata-pooler-xxxxx.run.app
+```
+
+When `pooler_url` is set, `gateway_pool_change_metadata` and
+`gateway_get_affected_partitions` (with `ensure_fresh=true` by default) call the
+service over HTTP (OIDC). Prefer that over in-process pooling in shared envs.
+
+**Dev/POC only — dbt graph pool:** mark models/sources and call from
+`on-run-start` (not recommended for production):
 
 ```yaml
 # models/schema.yml or sources.yml
@@ -370,12 +385,10 @@ sources:
           enable_changetracking: true
 ```
 
-Run once per invocation (typical) or from a script model:
-
 ```yaml
 on-run-start:
-  # Use do / empty return — the status list must not be injected as SQL
-  - "{% do gateway_pool_change_metadata(worker_pool_size=0) %}"
+  # POC: in-process graph pool. Prefer Cloud Run + pooler_url above.
+  - "{{ gateway_pool_change_metadata(worker_pool_size=0) }}"
 ```
 
 For each distinct FQN the pooler:

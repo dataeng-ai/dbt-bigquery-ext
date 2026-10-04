@@ -369,36 +369,78 @@ class CloudSqlGateway:
         last_status: Optional[str] = None,
         last_pooled_at: Optional[str] = None,
         conn=None,
+        *,
+        mark_registered: bool = False,
+        schedule_group: Optional[str] = None,
     ) -> None:
         fqn = relation_full_name(project, dataset, table)
-        sql = f"""
-            INSERT INTO {self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)} (
-                full_table_name, project, dataset, table_name,
-                partition_type, partition_granularity, partition_field,
-                change_history_enabled, last_status, last_pooled_at, updated_at
+        reg = self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)
+        if mark_registered:
+            sql = f"""
+                INSERT INTO {reg} (
+                    full_table_name, project, dataset, table_name,
+                    partition_type, partition_granularity, partition_field,
+                    change_history_enabled, enabled, schedule_group,
+                    unregistered_at, last_status, last_pooled_at, updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s,
+                    NULL, %s, %s, CURRENT_TIMESTAMP
+                )
+                ON CONFLICT (full_table_name) DO UPDATE SET
+                    partition_type = COALESCE(EXCLUDED.partition_type, {reg}.partition_type),
+                    partition_granularity = COALESCE(EXCLUDED.partition_granularity, {reg}.partition_granularity),
+                    partition_field = COALESCE(EXCLUDED.partition_field, {reg}.partition_field),
+                    change_history_enabled = COALESCE(EXCLUDED.change_history_enabled, {reg}.change_history_enabled),
+                    enabled = TRUE,
+                    schedule_group = COALESCE(EXCLUDED.schedule_group, {reg}.schedule_group),
+                    unregistered_at = NULL,
+                    last_status = COALESCE(EXCLUDED.last_status, {reg}.last_status),
+                    last_pooled_at = COALESCE(EXCLUDED.last_pooled_at, {reg}.last_pooled_at),
+                    updated_at = CURRENT_TIMESTAMP
+            """
+            params = (
+                fqn,
+                project,
+                dataset,
+                table,
+                partition_type,
+                partition_granularity,
+                partition_field,
+                change_history_enabled,
+                schedule_group or "default",
+                last_status,
+                last_pooled_at,
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (full_table_name) DO UPDATE SET
-                partition_type = EXCLUDED.partition_type,
-                partition_granularity = EXCLUDED.partition_granularity,
-                partition_field = EXCLUDED.partition_field,
-                change_history_enabled = EXCLUDED.change_history_enabled,
-                last_status = COALESCE(EXCLUDED.last_status, {self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)}.last_status),
-                last_pooled_at = COALESCE(EXCLUDED.last_pooled_at, {self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)}.last_pooled_at),
-                updated_at = CURRENT_TIMESTAMP
-        """
-        params = (
-            fqn,
-            project,
-            dataset,
-            table,
-            partition_type,
-            partition_granularity,
-            partition_field,
-            change_history_enabled,
-            last_status,
-            last_pooled_at,
-        )
+        else:
+            sql = f"""
+                INSERT INTO {reg} (
+                    full_table_name, project, dataset, table_name,
+                    partition_type, partition_granularity, partition_field,
+                    change_history_enabled, last_status, last_pooled_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (full_table_name) DO UPDATE SET
+                    partition_type = EXCLUDED.partition_type,
+                    partition_granularity = EXCLUDED.partition_granularity,
+                    partition_field = EXCLUDED.partition_field,
+                    change_history_enabled = EXCLUDED.change_history_enabled,
+                    last_status = COALESCE(EXCLUDED.last_status, {reg}.last_status),
+                    last_pooled_at = COALESCE(EXCLUDED.last_pooled_at, {reg}.last_pooled_at),
+                    updated_at = CURRENT_TIMESTAMP
+            """
+            params = (
+                fqn,
+                project,
+                dataset,
+                table,
+                partition_type,
+                partition_granularity,
+                partition_field,
+                change_history_enabled,
+                last_status,
+                last_pooled_at,
+            )
         if conn is not None:
             cur = conn.cursor()
             try:
@@ -410,6 +452,551 @@ class CloudSqlGateway:
             cur = c.cursor()
             try:
                 cur.execute(sql, params)
+            finally:
+                cur.close()
+
+    def register_change_tracking_table(
+        self,
+        project: str,
+        dataset: str,
+        table: str,
+        *,
+        schedule_group: str = "default",
+    ) -> Dict[str, Any]:
+        """Upsert registry row as enabled for scheduled pooling."""
+        self.upsert_change_tracking_registry(
+            project=project,
+            dataset=dataset,
+            table=table,
+            partition_type=None,
+            partition_granularity=None,
+            partition_field=None,
+            change_history_enabled=None,
+            mark_registered=True,
+            schedule_group=schedule_group,
+        )
+        return {
+            "full_table_name": relation_full_name(project, dataset, table),
+            "project": project,
+            "dataset": dataset,
+            "table": table,
+            "enabled": True,
+            "schedule_group": schedule_group,
+        }
+
+    def unregister_change_tracking_table(
+        self, project: str, dataset: str, table: str
+    ) -> Dict[str, Any]:
+        """Soft-disable a registry row (keep history)."""
+        fqn = relation_full_name(project, dataset, table)
+        reg = self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)
+        sql = f"""
+            UPDATE {reg}
+            SET enabled = FALSE,
+                unregistered_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE full_table_name = %s
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (fqn,))
+                updated = cur.rowcount
+            finally:
+                cur.close()
+        return {
+            "full_table_name": fqn,
+            "project": project,
+            "dataset": dataset,
+            "table": table,
+            "enabled": False,
+            "updated": int(updated or 0) > 0,
+        }
+
+    def list_change_tracking_registry(
+        self,
+        *,
+        enabled_only: bool = False,
+        schedule_group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        reg = self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)
+        clauses = ["1=1"]
+        params: List[Any] = []
+        if enabled_only:
+            clauses.append("enabled = TRUE")
+            clauses.append("unregistered_at IS NULL")
+        if schedule_group is not None:
+            clauses.append("schedule_group = %s")
+            params.append(schedule_group)
+        where = " AND ".join(clauses)
+        sql = f"""
+            SELECT full_table_name, project, dataset, table_name,
+                   partition_type, partition_granularity, partition_field,
+                   change_history_enabled, enabled, schedule_group,
+                   registered_at, unregistered_at, last_pooled_at, last_status
+            FROM {reg}
+            WHERE {where}
+            ORDER BY full_table_name
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "full_table_name": r[0],
+                    "project": r[1],
+                    "dataset": r[2],
+                    "table": r[3],
+                    "partition_type": r[4],
+                    "partition_granularity": r[5],
+                    "partition_field": r[6],
+                    "change_history_enabled": r[7],
+                    "enabled": r[8],
+                    "schedule_group": r[9],
+                    "registered_at": str(r[10]) if r[10] is not None else None,
+                    "unregistered_at": str(r[11]) if r[11] is not None else None,
+                    "last_pooled_at": str(r[12]) if r[12] is not None else None,
+                    "last_status": r[13],
+                }
+            )
+        return out
+
+    def get_change_tracking_registry_row(
+        self, project: str, dataset: str, table: str
+    ) -> Optional[Dict[str, Any]]:
+        fqn = relation_full_name(project, dataset, table)
+        reg = self._qualify(gateway_schema.CHANGE_TRACKING_REGISTRY_TABLE)
+        sql = f"""
+            SELECT full_table_name, project, dataset, table_name,
+                   partition_type, partition_granularity, partition_field,
+                   change_history_enabled, enabled, schedule_group,
+                   registered_at, unregistered_at, last_pooled_at, last_status
+            FROM {reg}
+            WHERE full_table_name = %s
+            LIMIT 1
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (fqn,))
+                r = cur.fetchone()
+            finally:
+                cur.close()
+        if not r:
+            return None
+        return {
+            "full_table_name": r[0],
+            "project": r[1],
+            "dataset": r[2],
+            "table": r[3],
+            "partition_type": r[4],
+            "partition_granularity": r[5],
+            "partition_field": r[6],
+            "change_history_enabled": r[7],
+            "enabled": r[8],
+            "schedule_group": r[9],
+            "registered_at": str(r[10]) if r[10] is not None else None,
+            "unregistered_at": str(r[11]) if r[11] is not None else None,
+            "last_pooled_at": str(r[12]) if r[12] is not None else None,
+            "last_status": r[13],
+        }
+
+    def list_change_tracking_log(
+        self,
+        project: str,
+        dataset: str,
+        table: str,
+        *,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Recent pool log rows for one relation (newest first)."""
+        fqn = relation_full_name(project, dataset, table)
+        lim = max(1, min(int(limit), 500))
+        log = self._qualify(gateway_schema.CHANGE_TRACKING_LOG_TABLE)
+        sql = f"""
+            SELECT id, full_table_name, pooled_at, delta_start_time, delta_end_time,
+                   partition_type, partition_granularity, partition_field,
+                   rows_changed, rows_insert, rows_update, rows_delete,
+                   partitions_changed_cnt, partition_ids,
+                   status, error, invocation_id
+            FROM {log}
+            WHERE full_table_name = %s
+            ORDER BY pooled_at DESC, id DESC
+            LIMIT {lim}
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (fqn,))
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            ids = r[13]
+            if ids is not None and not isinstance(ids, list):
+                ids = list(ids)
+            out.append(
+                {
+                    "id": r[0],
+                    "full_table_name": r[1],
+                    "pooled_at": str(r[2]) if r[2] is not None else None,
+                    "delta_start_time": str(r[3]) if r[3] is not None else None,
+                    "delta_end_time": str(r[4]) if r[4] is not None else None,
+                    "partition_type": r[5],
+                    "partition_granularity": r[6],
+                    "partition_field": r[7],
+                    "rows_changed": r[8],
+                    "rows_insert": r[9],
+                    "rows_update": r[10],
+                    "rows_delete": r[11],
+                    "partitions_changed_cnt": r[12],
+                    "partition_ids": ids,
+                    "status": r[14],
+                    "error": r[15],
+                    "invocation_id": r[16],
+                }
+            )
+        return out
+
+    def start_pooler_run(
+        self,
+        *,
+        started_at: str,
+        watermark_to: Optional[str] = None,
+        invocation_id: Optional[str] = None,
+        trigger: str = "api",
+        schedule_group: Optional[str] = None,
+        num_tables: int = 0,
+    ) -> int:
+        sql = f"""
+            INSERT INTO {self._qualify(gateway_schema.CHANGE_TRACKING_RUN_TABLE)} (
+                started_at, status, watermark_to, invocation_id,
+                trigger, schedule_group, num_tables
+            )
+            VALUES (%s, 'running', %s, %s, %s, %s, %s)
+            RETURNING id
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    sql,
+                    (
+                        started_at,
+                        watermark_to,
+                        invocation_id,
+                        trigger,
+                        schedule_group,
+                        num_tables,
+                    ),
+                )
+                row = cur.fetchone()
+                return int(row[0])
+            finally:
+                cur.close()
+
+    def append_pooler_run_event(
+        self,
+        run_id: int,
+        level: str,
+        message: str,
+        *,
+        full_table_name: Optional[str] = None,
+        status: Optional[str] = None,
+        logged_at: Optional[str] = None,
+    ) -> None:
+        sql = f"""
+            INSERT INTO {self._qualify(gateway_schema.CHANGE_TRACKING_RUN_EVENT_TABLE)} (
+                run_id, logged_at, level, message, full_table_name, status
+            )
+            VALUES (%s, COALESCE(%s::timestamp, CURRENT_TIMESTAMP), %s, %s, %s, %s)
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    sql,
+                    (
+                        run_id,
+                        logged_at,
+                        level.upper(),
+                        message,
+                        full_table_name,
+                        status,
+                    ),
+                )
+            finally:
+                cur.close()
+
+    def finish_pooler_run(
+        self,
+        run_id: int,
+        *,
+        completed_at: str,
+        status: str,
+        watermark_from: Optional[str] = None,
+        watermark_to: Optional[str] = None,
+        num_tables: int = 0,
+        num_warnings: int = 0,
+        num_errors: int = 0,
+        summary: Optional[str] = None,
+    ) -> None:
+        sql = f"""
+            UPDATE {self._qualify(gateway_schema.CHANGE_TRACKING_RUN_TABLE)}
+            SET completed_at = %s,
+                status = %s,
+                watermark_from = COALESCE(%s, watermark_from),
+                watermark_to = COALESCE(%s, watermark_to),
+                num_tables = %s,
+                num_warnings = %s,
+                num_errors = %s,
+                summary = %s
+            WHERE id = %s
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    sql,
+                    (
+                        completed_at,
+                        status,
+                        watermark_from,
+                        watermark_to,
+                        num_tables,
+                        num_warnings,
+                        num_errors,
+                        summary,
+                        run_id,
+                    ),
+                )
+            finally:
+                cur.close()
+
+    def list_pooler_runs(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        lim = max(1, min(int(limit), 500))
+        sql = f"""
+            SELECT id, started_at, completed_at, status,
+                   watermark_from, watermark_to,
+                   num_tables, num_warnings, num_errors,
+                   invocation_id, trigger, schedule_group, summary
+            FROM {self._qualify(gateway_schema.CHANGE_TRACKING_RUN_TABLE)}
+            ORDER BY started_at DESC, id DESC
+            LIMIT {lim}
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r[0],
+                    "started_at": str(r[1]) if r[1] is not None else None,
+                    "completed_at": str(r[2]) if r[2] is not None else None,
+                    "status": r[3],
+                    "watermark_from": str(r[4]) if r[4] is not None else None,
+                    "watermark_to": str(r[5]) if r[5] is not None else None,
+                    "num_tables": r[6],
+                    "num_warnings": r[7],
+                    "num_errors": r[8],
+                    "invocation_id": r[9],
+                    "trigger": r[10],
+                    "schedule_group": r[11],
+                    "summary": r[12],
+                }
+            )
+        return out
+
+    def get_pooler_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        sql = f"""
+            SELECT id, started_at, completed_at, status,
+                   watermark_from, watermark_to,
+                   num_tables, num_warnings, num_errors,
+                   invocation_id, trigger, schedule_group, summary
+            FROM {self._qualify(gateway_schema.CHANGE_TRACKING_RUN_TABLE)}
+            WHERE id = %s
+            LIMIT 1
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (run_id,))
+                r = cur.fetchone()
+            finally:
+                cur.close()
+        if not r:
+            return None
+        return {
+            "id": r[0],
+            "started_at": str(r[1]) if r[1] is not None else None,
+            "completed_at": str(r[2]) if r[2] is not None else None,
+            "status": r[3],
+            "watermark_from": str(r[4]) if r[4] is not None else None,
+            "watermark_to": str(r[5]) if r[5] is not None else None,
+            "num_tables": r[6],
+            "num_warnings": r[7],
+            "num_errors": r[8],
+            "invocation_id": r[9],
+            "trigger": r[10],
+            "schedule_group": r[11],
+            "summary": r[12],
+        }
+
+    def list_pooler_run_events(self, run_id: int) -> List[Dict[str, Any]]:
+        sql = f"""
+            SELECT id, run_id, logged_at, level, message, full_table_name, status
+            FROM {self._qualify(gateway_schema.CHANGE_TRACKING_RUN_EVENT_TABLE)}
+            WHERE run_id = %s
+            ORDER BY id ASC
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (run_id,))
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+        return [
+            {
+                "id": r[0],
+                "run_id": r[1],
+                "logged_at": str(r[2]) if r[2] is not None else None,
+                "level": r[3],
+                "message": r[4],
+                "full_table_name": r[5],
+                "status": r[6],
+            }
+            for r in rows
+        ]
+
+    def upsert_permission_issue(
+        self,
+        *,
+        project: str,
+        dataset: str,
+        sa_email: str,
+        required_role: str,
+        scope: str = "dataset",
+        last_error: Optional[str] = None,
+    ) -> int:
+        tbl = self._qualify(gateway_schema.CHANGE_TRACKING_PERMISSION_ISSUE_TABLE)
+        sql = f"""
+            INSERT INTO {tbl} (
+                project, dataset, sa_email, required_role, scope, last_error,
+                status, first_seen_at, last_seen_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, 'open', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (project, dataset, sa_email, required_role, scope) DO UPDATE SET
+                last_error = EXCLUDED.last_error,
+                status = 'open',
+                last_seen_at = CURRENT_TIMESTAMP,
+                resolved_at = NULL
+            RETURNING id
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    sql,
+                    (project, dataset, sa_email, required_role, scope, last_error),
+                )
+                row = cur.fetchone()
+                return int(row[0])
+            finally:
+                cur.close()
+
+    def list_permission_issues(
+        self, *, status: str = "open", limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        lim = max(1, min(int(limit), 500))
+        tbl = self._qualify(gateway_schema.CHANGE_TRACKING_PERMISSION_ISSUE_TABLE)
+        sql = f"""
+            SELECT id, project, dataset, sa_email, required_role, scope,
+                   last_error, status, first_seen_at, last_seen_at, resolved_at
+            FROM {tbl}
+            WHERE status = %s
+            ORDER BY last_seen_at DESC, id DESC
+            LIMIT {lim}
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (status,))
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+        return [
+            {
+                "id": r[0],
+                "project": r[1],
+                "dataset": r[2],
+                "sa_email": r[3],
+                "required_role": r[4],
+                "scope": r[5],
+                "last_error": r[6],
+                "status": r[7],
+                "first_seen_at": str(r[8]) if r[8] is not None else None,
+                "last_seen_at": str(r[9]) if r[9] is not None else None,
+                "resolved_at": str(r[10]) if r[10] is not None else None,
+            }
+            for r in rows
+        ]
+
+    def get_permission_issue(self, issue_id: int) -> Optional[Dict[str, Any]]:
+        tbl = self._qualify(gateway_schema.CHANGE_TRACKING_PERMISSION_ISSUE_TABLE)
+        sql = f"""
+            SELECT id, project, dataset, sa_email, required_role, scope,
+                   last_error, status, first_seen_at, last_seen_at, resolved_at
+            FROM {tbl}
+            WHERE id = %s
+            LIMIT 1
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (issue_id,))
+                r = cur.fetchone()
+            finally:
+                cur.close()
+        if not r:
+            return None
+        return {
+            "id": r[0],
+            "project": r[1],
+            "dataset": r[2],
+            "sa_email": r[3],
+            "required_role": r[4],
+            "scope": r[5],
+            "last_error": r[6],
+            "status": r[7],
+            "first_seen_at": str(r[8]) if r[8] is not None else None,
+            "last_seen_at": str(r[9]) if r[9] is not None else None,
+            "resolved_at": str(r[10]) if r[10] is not None else None,
+        }
+
+    def resolve_permission_issue(self, issue_id: int) -> None:
+        tbl = self._qualify(gateway_schema.CHANGE_TRACKING_PERMISSION_ISSUE_TABLE)
+        sql = f"""
+            UPDATE {tbl}
+            SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """
+        with self.connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (issue_id,))
             finally:
                 cur.close()
 
