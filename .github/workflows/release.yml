@@ -18,7 +18,7 @@ permissions:
 jobs:
   pypi:
     name: PyPI
-    if: ${{ (github.event_name == 'push' || inputs.pypi) && secrets.PYPI_API_TOKEN != '' }}
+    if: github.event_name == 'push' || inputs.pypi
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +30,10 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
+          if [ -z "$TWINE_PASSWORD" ]; then
+            echo "PYPI_API_TOKEN is not set; skipping PyPI upload"
+            exit 0
+          fi
           python -m pip install -U build twine
           python -m build
           python -m twine upload dist/*
